@@ -1,0 +1,576 @@
+<!doctype html>
+<html><head><meta charset="utf-8"></head><body><script>
+'use strict';
+/* Vega TV provider runtime: mirrors sandboxWorker shims (fetch/axios/
+   cheerio/getBaseUrl/kv/Crypto) using the WebView's own network stack.
+   One realm per provider (reloaded on switch), one invoke at a time. */
+
+// ---- private-host guard (mirrors urlGuard.ts) ----
+function __isBlockedHost(h){
+  h=(h||'').toLowerCase();
+  if(!h) return true;
+  if(h==='localhost'||h.slice(-10)==='.localhost'||h.slice(-6)==='.local'||h.slice(-9)==='.internal') return true;
+  if(/^(\d+\.){3}\d+$/.test(h)){
+    var p=h.split('.').map(Number);
+    if(p[0]===10||p[0]===127||p[0]===0||p[0]>=224) return true;
+    if(p[0]===172&&p[1]>=16&&p[1]<=31) return true;
+    if(p[0]===192&&p[1]===168) return true;
+    if(p[0]===169&&p[1]===254) return true;
+  }
+  return false;
+}
+var __realFetch = window.fetch.bind(window);
+function __wafThrow(url){
+  try{ var h=new URL(String(url), window.location.href).hostname; }
+  catch(e){ var h=''; }
+  throw new Error('WAF_REQUIRED:'+h+':'+String(url));
+}
+function __b64ToBytes(b64){
+  var bin=atob(String(b64||'')), n=bin.length, out=new Uint8Array(n);
+  for(var i=0;i<n;i++) out[i]=bin.charCodeAt(i);
+  return out;
+}
+/* The WebView's own fetch is CORS-bound: this page's origin is https://localhost/,
+   so a cross-origin provider request is rejected before it reaches the network
+   unless the site opts in. VegaHttp performs the request with native OkHttp
+   instead. Fall back to WebView fetch if the bridge is absent (shouldn't happen
+   in the app, but keeps the file runnable in a browser). */
+function __nativeFetch(url, init){
+  init=init||{};
+  // A pre-aborted signal still has to short-circuit. An abort *during* the call
+  // cannot: the bridge is synchronous, so JS is blocked until OkHttp returns.
+  if(init.signal&&init.signal.aborted) return Promise.reject(new Error('Aborted'));
+  var headers=init.headers||{};
+  var body=init.body;
+  var payload={url:String(url), method:String(init.method||'GET'), headers:{}};
+  for(var k in headers){ if(Object.prototype.hasOwnProperty.call(headers,k)) payload.headers[k]=String(headers[k]); }
+  if(body!==undefined&&body!==null){
+    try{ payload.bodyBase64=btoa(String(body)); }catch(e){}
+  }
+  var res;
+  try{ res=JSON.parse(window.VegaHttp.fetch(JSON.stringify(payload))); }
+  catch(e){ return Promise.reject(new Error('Native fetch bridge failed: '+(e&&e.message||e))); }
+  if(!res.ok) return Promise.reject(new Error('Native fetch failed: '+(res.error||'unknown')));
+  var bytes=__b64ToBytes(res.bodyBase64);
+  /* ArrayBuffer body so a caller can stream it into a player; the shim's
+     .text() decodes it, and the only direct field readers are the WAF sniff. */
+  var response=new Response(bytes,{status:res.status,statusText:res.statusText||'',headers:res.headers||{}});
+  try{ Object.defineProperty(response,'url',{value:res.url||String(url)}); }catch(e){}
+  if(res.status===403||res.status===503){
+    return response.text().then(function(t){
+      if(/challenge-platform|just a moment|cf-chl|captcha/i.test(t||'')) __wafThrow(url);
+      return new Response(t,{status:res.status,statusText:res.statusText||'',headers:res.headers||{}});
+    }, function(){ return response; });
+  }
+  return Promise.resolve(response);
+}
+function __hasNativeFetch(){
+  try{ return typeof window.VegaHttp!=='undefined' && typeof window.VegaHttp.fetch==='function'; }
+  catch(e){ return false; }
+}
+window.__vegaFetch = function(url, init){
+  var u;
+  try{
+    u=new URL(String(url), window.location.href);
+    if(u.protocol!=='http:'&&u.protocol!=='https:') return Promise.reject(new Error('Blocked protocol'));
+    if(__isBlockedHost(u.hostname)) return Promise.reject(new Error('Blocked private host'));
+  }catch(e){ return Promise.reject(e); }
+  if(__hasNativeFetch()) return __nativeFetch(u.toString(), init);
+  return __realFetch(url, init).then(function(resp){
+    if(resp.status===403||resp.status===503){
+      return resp.clone().text().then(function(t){
+        if(/challenge-platform|just a moment|cf-chl|captcha/i.test(t||'')) __wafThrow(url);
+        return resp;
+      }, function(){ return resp; });
+    }
+    return resp;
+  });
+};
+window.fetch = window.__vegaFetch;
+
+// ---- cheerio shim (DOM-backed subset used by providers) ----
+/* Providers use the traversal half of cheerio, not just find(). The meta bundle
+   in particular walks siblings — heading.next('p'), .prev(), .is(), .nextAll() —
+   and the stream bundle uses the :contains() pseudo. None of that existed in
+   the first version of this shim, which is why the catalog rendered and the
+   detail screen died on "heading.next is not a function". */
+window.__cheerio = { load: function(html){
+  var doc = new DOMParser().parseFromString(String(html==null?'':html), 'text/html');
+  function norm(s){
+    if(typeof s!=='string') return null;
+    s=s.replace(/^\s+|\s+$/g,'');
+    return s.length?s:null;
+  }
+  /* Split on top-level commas only: a comma inside quotes or brackets
+     (e.g. [href*='a,b']) belongs to the selector, not to a group separator. */
+  function splitSel(sel){
+    var parts=[],buf='',q=null,depth=0;
+    for(var i=0;i<sel.length;i++){
+      var c=sel[i];
+      if(q){ buf+=c; if(c===q&&sel[i-1]!=='\\') q=null; continue; }
+      if(c==='"'||c==="'"){ q=c; buf+=c; continue; }
+      if(c==='['||c==='('){ depth++; buf+=c; continue; }
+      if(c===']'||c===')'){ depth--; buf+=c; continue; }
+      if(c===','&&depth===0){ parts.push(buf); buf=''; continue; }
+      buf+=c;
+    }
+    if(buf.length) parts.push(buf);
+    return parts;
+  }
+  /* cheerio's :contains('x') is a text test, not a CSS feature — querySelectorAll
+     throws on it. It also appears COMPOUND ("a:contains('V-Cloud')"), not only
+     bare, so pull the text out of each group and test it alongside the
+     structural part rather than handing the whole thing to the engine. */
+  var CONTAINS=/:contains\(\s*(['"])([\s\S]*?)\1\s*\)/g;
+  function matches(el,sel){
+    sel=norm(sel); if(sel===null) return false;
+    var parts=splitSel(sel);
+    for(var j=0;j<parts.length;j++){
+      var p=parts[j].replace(/^\s+|\s+$/g,'');
+      if(!p.length) continue;
+      var text=null;
+      if(/:contains\(/.test(p)){
+        // Every :contains in this group must hold (cheerio ANDs them).
+        CONTAINS.lastIndex=0;
+        var mm;
+        while((mm=CONTAINS.exec(p))!==null){
+          if((el.textContent||'').indexOf(mm[2])<0){ text=''; break; }
+          text=mm[2];
+        }
+        if(text==='') continue;
+        p=p.replace(CONTAINS,'').replace(/^\s+|\s+$/g,'');
+      }
+      // No structural part left means :contains() was the whole selector.
+      if(!p.length){
+        if(text!==null) return true;
+        continue;
+      }
+      try{ if(el.matches(p)) return true; }catch(e){}
+    }
+    return false;
+  }
+  function query(root,sel){
+    sel=norm(sel); if(sel===null) return [];
+    if(/:contains\(/.test(sel)){
+      // Drop the pseudo to get a selector the engine accepts, then re-test the
+      // real selector ourselves. Also handles a group that was ONLY :contains.
+      var stripped=sel.replace(/:contains\(\s*(['"])([\s\S]*?)\1\s*\)/g,' ')
+                       .replace(/,\s*,/g,',').replace(/^\s*,|,\s*$/g,'').trim();
+      var cands;
+      try{ cands=stripped.length? root.querySelectorAll(stripped) : root.querySelectorAll('*'); }
+      catch(e){ cands=[]; }
+      var out=[];
+      for(var i=0;i<cands.length;i++) if(matches(cands[i],sel)) out.push(cands[i]);
+      return out;
+    }
+    try{ return Array.prototype.slice.call(root.querySelectorAll(sel)); }catch(e){ return []; }
+  }
+  /* cheerio siblings are element siblings — adjacent text nodes are skipped. */
+  function siblings(el,dir){
+    var p=el&&el.parentElement;
+    if(!p) return [];
+    var kids=Array.prototype.slice.call(p.children||[]);
+    var idx=kids.indexOf(el);
+    if(idx<0) return [];
+    return dir>0? kids.slice(idx+1) : kids.slice(0,idx);
+  }
+  function wrap(nodes){
+    nodes=nodes||[];
+    var coll = {
+      _n: nodes,
+      get length(){ return this._n.length; },
+      /* A real cheerio collection is array-like AND iterable. Bundles write
+         `for (const el of $vLink(...))`, and none of those see a bare
+         {length, each, ...} object -- for...of threw
+         "vLinkGofileBtns is not iterable" in the HubCloud extractor
+         (dist/4khdhub/stream.js). A missing Symbol.iterator is a structural
+         gap, not a missing method, so it has to be fixed on the object itself.
+         Numeric `get` is here for the same reason: real cheerio supports
+         sel[0], and providers index selections directly. */
+      [Symbol.iterator]: function(){ return this._n[Symbol.iterator](); },
+      get: function(i){ return this._n[i]; },
+      /* Callback argument order is (index, element) and `this` is the element.
+         That is cheerio's own contract, not jQuery's: `map`/`each`/`filter` are
+         all declared `fn: (this: T, i: number, el: T) => ...` and invoke
+         `fn.call(el, i, el)`.
+
+         Passing (el, i) instead did not throw -- it quietly broke every
+         iteration, because these callbacks do not dereference the element
+         directly, they hand it straight back to `$()`. The ubiquitous scrape
+         shape is `children().map((i, element) => { ... $(element).find(...) ... })`,
+         so `element` was an integer, `$(0)` matched nothing, and the callback
+         returned undefined at every index. cheerio's real `map` also drops
+         null/undefined, so the result was an array of 18 undefined and a
+         non-empty feed serialised to `{"__ok":[null,null,...]}`, which decoded
+         to a list of posts with blank title and link -- the home screen's
+         "No content found", with no error anywhere, for every provider. */
+      each: function(fn){ for(var i=0;i<this._n.length;i++){ if(fn.call(this._n[i],i,this._n[i])===false) break; } return this; },
+      /* Returns a plain array, as real cheerio does. The previous shim returned
+         `{get(){return out;}}`, so a provider writing `.map(fn)[0]` indexed a
+         FUNCTION, got undefined, and reported a missing link. */
+      map: function(fn){ var out=[]; for(var i=0;i<this._n.length;i++){ var el=this._n[i]; var v=fn.call(el,i,el); if(v===null||v===undefined) continue; if(Array.isArray(v)){ for(var j=0;j<v.length;j++) out.push(v[j]); } else out.push(v); } return out; },
+      toArray: function(){ return this._n.slice(); },
+      find: function(sel){ var out=[]; for(var i=0;i<this._n.length;i++) out=out.concat(query(this._n[i],sel)); return wrap(out); },
+      children: function(sel){ var out=[]; this._n.forEach(function(el){ Array.prototype.forEach.call(el.children||[],function(c){ if(sel==null||matches(c,sel)) out.push(c); }); }); return wrap(out); },
+      contents: function(){ var out=[]; this._n.forEach(function(el){ Array.prototype.forEach.call(el.childNodes||[],function(c){ out.push(c); }); }); return wrap(out); },
+      parent: function(sel){ var out=[]; this._n.forEach(function(el){ var p=el.parentElement; if(p&&(sel==null||matches(p,sel))) out.push(p); }); return wrap(out); },
+      parents: function(sel){ var out=[]; this._n.forEach(function(el){ var p=el.parentElement; while(p){ if(sel==null||matches(p,sel)) out.push(p); p=p.parentElement; } }); return wrap(out); },
+      closest: function(sel){ var out=[]; this._n.forEach(function(el){ try{ var c=el.closest(sel); if(c) out.push(c); }catch(e){} }); return wrap(out); },
+      eq: function(i){ return wrap(this._n.slice(i,i+1)); },
+      first: function(){ return wrap(this._n.slice(0,1)); },
+      last: function(){ return wrap(this._n.slice(-1)); },
+      slice: function(a,b){ return wrap(this._n.slice(a,b)); },
+      filter: function(sel){ var out=[]; this._n.forEach(function(el,i){ if(typeof sel==='function'){ if(sel.call(el,i,el)) out.push(el); } else if(matches(el,sel)) out.push(el); }); return wrap(out); },
+      not: function(sel){ return wrap(this._n.filter(function(el){ return !matches(el,sel); })); },
+      is: function(sel){ return this._n.some(function(el){ return matches(el,sel); }); },
+      hasClass: function(c){ return this._n.some(function(el){ return !!(el.classList&&el.classList.contains(c)); }); },
+      addClass: function(c){ this._n.forEach(function(el){ if(el.classList) el.classList.add(c); }); return this; },
+      removeClass: function(c){ this._n.forEach(function(el){ if(el.classList) el.classList.remove(c); }); return this; },
+      has: function(sel){ return this._n.some(function(el){ return query(el,sel).length>0; }); },
+      end: function(){ return this; },
+      next: function(sel){ var out=[]; this._n.forEach(function(el){ var nx=siblings(el,1)[0]; if(nx&&(sel==null||matches(nx,sel))) out.push(nx); }); return wrap(out); },
+      nextAll: function(sel){ var out=[]; this._n.forEach(function(el){ siblings(el,1).forEach(function(nx){ if(sel==null||matches(nx,sel)) out.push(nx); }); }); return wrap(out); },
+      prev: function(sel){ var out=[]; this._n.forEach(function(el){ var pv=siblings(el,-1).slice(-1)[0]; if(pv&&(sel==null||matches(pv,sel))) out.push(pv); }); return wrap(out); },
+      prevAll: function(sel){ var out=[]; this._n.forEach(function(el){ siblings(el,-1).forEach(function(pv){ if(sel==null||matches(pv,sel)) out.push(pv); }); }); return wrap(out); },
+      text: function(){ return this._n.map(function(el){ return el.textContent; }).join(''); },
+      html: function(v){
+        if(v===undefined) return this._n.length? (this._n[0].innerHTML!==undefined? this._n[0].innerHTML : this._n[0].textContent) : '';
+        this._n.forEach(function(el){ el.innerHTML=v; });
+        return this;
+      },
+      attr: function(n,v){
+        if(v===undefined){ var el=this._n[0]; return el? el.getAttribute(n) : undefined; }
+        this._n.forEach(function(el){ el.setAttribute(n,v); });
+        return this;
+      },
+      removeAttr: function(n){ this._n.forEach(function(el){ el.removeAttribute(n); }); return this; },
+      remove: function(){ this._n.forEach(function(el){ if(el.parentElement) el.parentElement.removeChild(el); }); return this; },
+      prop: function(n,v){
+        if(v===undefined){ var el=this._n[0]; return el? el[n] : undefined; }
+        this._n.forEach(function(el){ el[n]=v; });
+        return this;
+      },
+      css: function(n,v){
+        if(v===undefined){ var el=this._n[0]; return el&&el.style? el.style[n] : undefined; }
+        this._n.forEach(function(el){ if(el.style) el.style[n]=v; });
+        return this;
+      },
+      val: function(){ var el=this._n[0]; return el? (el.value!==undefined? el.value : el.getAttribute('value')) : undefined; },
+      index: function(){
+        var el=this._n[0];
+        if(!el||!el.parentElement) return -1;
+        return Array.prototype.indexOf.call(el.parentElement.children||[], el);
+      }
+    };
+    /* Numeric indexing. Real cheerio collections are array-like, so sel[0]
+       reads a node and providers rely on it. Methods and length are own
+       properties, so a numeric key is free to fall through to the node list
+       without shadowing anything. */
+    return new Proxy(coll, {
+      get: function(t,k){
+        if(typeof k==='string' && /^\d+$/.test(k)) return t._n[Number(k)];
+        return t[k];
+      }
+    });
+  }
+  function $(sel){
+    if(typeof sel==='string'){
+      // cheerio.load('<li>x</li>') is legal — it parses the fragment.
+      if(/^\s*</.test(sel)){
+        try{ var t=doc.createElement('div'); t.innerHTML=sel; return wrap(Array.prototype.slice.call(t.childNodes)); }
+        catch(e){ return wrap([]); }
+      }
+      return wrap(query(doc,sel));
+    }
+    if(sel&&sel.nodeType) return wrap([sel]);
+    if(sel&&sel._n) return sel;
+    if(sel===doc) return wrap([doc.documentElement]);
+    return wrap([]);
+  }
+  $._root=doc;
+  $.root=function(){ return wrap([doc.documentElement]); };
+  return $;
+}};
+
+// ---- axios shim over mediated fetch ----
+async function __axiosReq(method, url, opts){
+  opts=opts||{};
+  var headers=Object.assign({}, opts.headers||{});
+  var finalUrl=url;
+  if(opts.params){ try{ var q=new URLSearchParams(opts.params).toString(); if(q) finalUrl+=(finalUrl.indexOf('?')>=0?'&':'?')+q; }catch(e){} }
+  var b=undefined; var body=opts.data;
+  if(body!==undefined&&body!==null){
+    if(typeof body==='string'||body instanceof FormData||body instanceof URLSearchParams||body instanceof ArrayBuffer||ArrayBuffer.isView(body)){ b=body; }
+    else { try{ b=JSON.stringify(body); }catch(e){ b=String(body); } if(!headers['Content-Type']&&!headers['content-type']) headers['Content-Type']='application/json'; }
+  }
+  var reqInit={method:method,headers:headers};
+  if(b!==undefined) reqInit.body=b;
+  if(opts.signal) reqInit.signal=opts.signal;
+  var resp=await window.__vegaFetch(finalUrl,reqInit);
+  var text=await resp.text();
+  if((resp.status===403||resp.status===503)&&/challenge-platform|just a moment|cf-chl|captcha/i.test(text||'')){
+    try{ var _h=new URL(finalUrl).hostname; }catch(e){ var _h=''; }
+    throw new Error('WAF_REQUIRED:'+_h+':'+finalUrl);
+  }
+  var data=text;
+  if(!opts.responseType||opts.responseType==='json'){ try{ data=text?JSON.parse(text):''; }catch(e){ data=text; } }
+  else if(opts.responseType==='text'){ data=text; }
+  else if(opts.responseType==='arraybuffer'||opts.responseType==='blob'){ data=text; }
+  var outHeaders={}; try{ resp.headers.forEach(function(v,k){ outHeaders[k]=v; }); }catch(e){}
+  var result={data:data,status:resp.status,statusText:resp.statusText,headers:outHeaders,config:{url:url},request:{url:finalUrl,responseURL:resp.url}};
+  if(opts.validateStatus&&!opts.validateStatus(resp.status)){
+    var err=new Error('Request failed with status code '+resp.status);
+    err.response=result; err.config=opts; err.isAxiosError=true; throw err;
+  }
+  return result;
+}
+/* Real axios is itself callable: `axios(url, config)` is the documented
+   shorthand for a GET. The bundles use that form — dist/4khdhub/stream.js has
+   two such call sites (`yield axios(link,{headers:headers,signal:signal})`)
+   alongside its `axios.get` ones. As a plain object this shim threw
+   "axios is not a function" the moment one of those ran, so the shim is a
+   function with the methods attached to it. The methods must be read off the
+   shim itself rather than closed over, because the return value *is* the shim
+   and `create()` must keep returning something just as callable. */
+var __axiosShim=function(u,o){
+  if(typeof u==='object'&&u!==null&&u.url!==undefined) return __axiosShim.request(u);
+  return __axiosReq('GET',u,o||{});
+};
+__axiosShim.get=function(u,o){ return __axiosReq('GET',u,o||{}); };
+__axiosShim.post=function(u,d,o){ var x=o||{}; x.data=d; return __axiosReq('POST',u,x); };
+__axiosShim.put=function(u,d,o){ var x=o||{}; x.data=d; return __axiosReq('PUT',u,x); };
+__axiosShim.patch=function(u,d,o){ var x=o||{}; x.data=d; return __axiosReq('PATCH',u,x); };
+__axiosShim.delete=function(u,o){ return __axiosReq('DELETE',u,o||{}); };
+__axiosShim.head=function(u,o){ return __axiosReq('HEAD',u,o||{}); };
+__axiosShim.options=function(u,o){ return __axiosReq('OPTIONS',u,o||{}); };
+__axiosShim.request=function(o){ o=o||{}; return __axiosReq(((o.method||'GET').toUpperCase()),o.url,o); };
+__axiosShim.create=function(){ return window.__axiosShim; };
+__axiosShim.isAxiosError=function(e){ return !!(e&&e.isAxiosError); };
+__axiosShim.defaults={headers:{common:{'Accept':'application/json, text/plain, */*'}}};
+/* Bundled builds interop as `axios.default.get(...)`; without this the second
+   hop throws on an undefined default export. */
+__axiosShim.default=__axiosShim;
+window.__axiosShim=__axiosShim;
+window.__axiosShim.defaults=window.__axiosShim.defaults;
+window.axios=window.__axiosShim;
+
+// ---- providerRpc bridge ----
+/* Upstream runs providers in a Worker with no network of its own: every fetch,
+   every kv read, every "the user must clear this challenge" request is an RPC
+   up to the host. VegaHttp.rpc is the TV equivalent of providerRpc.ts's nine
+   operations.
+
+   The bridge is synchronous (@JavascriptInterface cannot await), so the two ops
+   that genuinely need a UI or disk round trip answer `{pending:true,
+   requestId:…}` and JS polls VegaHttp.rpcPending until the host has the real
+   answer. That keeps a normal promise on the JS side without depending on an
+   async JS bridge, which not every TV WebView exposes. */
+var __pv='';   // provider value for this invoke, set by __vegaInvoke
+function __rpc(op,args,waitTries){
+  args=Object.assign({providerValue:__pv},args||{});
+  var res;
+  try{ res=JSON.parse(window.VegaHttp.rpc(op,JSON.stringify(args))); }
+  catch(e){ return Promise.reject(new Error('rpc '+op+' bridge failed: '+(e&&e.message||e))); }
+  if(!res.ok) return Promise.reject(new Error(res.error||('rpc '+op+' failed')));
+  if(!res.pending) return Promise.resolve(res.value===undefined?null:res.value);
+  var id=res.requestId;
+  var tries=0;
+  var limit=waitTries||100;               // 20s default
+  if(op==='openWebView') limit=900;       // 180s: a human is solving a challenge
+  return new Promise(function(resolve,reject){
+    var iv=setInterval(function(){
+      tries++;
+      var p;
+      try{ p=JSON.parse(window.VegaHttp.rpcPending(id)); }
+      catch(e){ clearInterval(iv); reject(e); return; }
+      if(p.pending) return;
+      clearInterval(iv);
+      if(p.ok) resolve(p.value===undefined?null:p.value);
+      else reject(new Error(p.error||('rpc '+op+' failed')));
+    },200);
+    if(limit>0&&tries>limit){ clearInterval(iv); reject(new Error('rpc '+op+' timed out')); }
+  });
+}
+function __b64ToHex(b64){
+  var b=__b64ToBytes(b64), out='';
+  for(var i=0;i<b.length;i++) out+=('0'+b[i].toString(16)).slice(-2);
+  return out;
+}
+function __utf8ToB64(s){
+  var bytes=new TextEncoder().encode(String(s)), bin='', chunk=0x8000;
+  for(var i=0;i<bytes.length;i+=chunk){
+    bin+=String.fromCharCode.apply(null,bytes.subarray(i,i+chunk));
+  }
+  return btoa(bin);
+}
+
+// ---- kvStore (persistent, namespaced per provider; mirrors providerKvStorage) ----
+/* The real bundles call providerContext.kvStore 192 times: it is where they keep
+   a cf_clearance cookie, a scraped token, a memoised catalog, and per-episode
+   resume points. This used to be a plain JS object on this page, so every
+   invoke started from an empty store and a Cloudflare clearance earned on one
+   call was gone by the next — which is why a solved challenge kept reappearing
+   and token-gated providers could never work at all. Now it is backed by
+   DataStore natively, keyed "<provider>:<key>".
+
+   Strings are stored verbatim; anything else is JSON-encoded. That mirrors how
+   providers actually use it (they overwhelmingly store a token and read it back
+   as text) and avoids re-parsing "123" into a number on the way out. */
+window.__kvStore={
+  get:function(k){ return __rpc('kvGet',{key:String(k)}); },
+  set:function(k,v){
+    var s=(typeof v==='string')?v:JSON.stringify(v===undefined?null:v);
+    return __rpc('kvSet',{key:String(k),value:s});
+  },
+  delete:function(k){ return __rpc('kvDelete',{key:String(k)}); },
+  keys:function(){ return __rpc('kvKeys',{}); },
+  values:function(){ var s=this; return s.keys().then(function(ks){
+    return Promise.all(ks.map(function(k){ return s.get(k); })); }); },
+  entries:function(){ var s=this; return s.keys().then(function(ks){
+    return Promise.all(ks.map(function(k){ return s.get(k).then(function(v){ return [k,v]; }); })); }); },
+  clear:function(){ return __rpc('kvClear',{}); }
+};
+
+// ---- Crypto (digest/random via native MessageDigest, like providerRpc.crypto) ----
+window.__cryptoShim={
+  digestStringAsync:function(algo,msg){
+    return __rpc('crypto',{algorithm:String(algo||''), data:__utf8ToB64(msg)}).then(__b64ToHex);
+  },
+  /* Upstream decodes its base64 random bytes back into a Uint8Array; returning
+     a plain Array instead broke providers that call .buffer or index it as
+     bytes, so keep the typed array. */
+  getRandomBytesAsync:function(n){
+    var a=new Uint8Array(Math.min(n||0,1024));
+    crypto.getRandomValues(a);
+    return Promise.resolve(a);
+  },
+  randomUUID:function(){ return (crypto.randomUUID? crypto.randomUUID() : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g,function(c){ var r=Math.random()*16|0; return (c==='x'?r:(r&0x3|0x8)).toString(16); })); }
+};
+
+// ---- getBaseUrl (native, 1h cache, mirrors getBaseUrl.ts) ----
+window.__getBaseUrl=function(pv){
+  return __rpc('getBaseUrl',{providerValue:String(pv)}).then(function(u){ return (u==null?'':String(u)); });
+};
+
+/* TypeScript's helper for transpiled async functions. Bundles that were not
+   fully bundled inline (or built without tslib) call __awaiter as a bare
+   identifier; the mobile sandbox passes it as a module parameter, so the TV
+   runtime must expose the same shape or those modules die with a
+   ReferenceError at load. */
+window.__awaiter=function(thisArg,args,PromiseConstructor,generator){
+  var C=PromiseConstructor||Promise;
+  var adopt=function(v){ return (v instanceof C)? v : new C(function(r){ r(v); }); };
+  return new C(function(resolve,reject){
+    var iterator;
+    var step=function(result){
+      if(result.done){ resolve(result.value); return; }
+      adopt(result.value).then(fulfilled,rejected);
+    };
+    var fulfilled=function(value){ try{ step(iterator.next(value)); }catch(e){ reject(e); } };
+    var rejected=function(value){ try{ step(iterator.throw(value)); }catch(e){ reject(e); } };
+    iterator=generator.apply(thisArg,args||[]);
+    step(iterator.next());
+  });
+};
+
+// ---- sandbox state ----
+window.__vegaReset=function(){
+  window.__vegaExports={};
+  window.__vegaModule={exports:window.__vegaExports};
+  window.providerGlobal={};
+  window.__code='';
+  // Bare-name aliases: bundles run with "use strict" and reference `exports`
+  // / `module` directly; globals resolve via window in any eval scope.
+  window.exports=window.__vegaExports;
+  window.module=window.__vegaModule;
+};
+window.__vegaReset();
+// Provider bundles call console.log heavily (they log the URL they build and
+// every post they parse). Forward it natively so a TV user can read what the
+// provider actually did; there is no logcat on a TV box. The sink is defined
+// BEFORE any override so a missing bridge degrades to a no-op, never a throw.
+window.__vegaNativeTrace=function(line){
+  try{ if(window.VegaHttp&&window.VegaHttp.trace) window.VegaHttp.trace(String(line)); }catch(e){}
+};
+window.__vegaConsole=function(level,args){
+  try{
+    var parts=[]; for(var i=0;i<args.length;i++){
+      var a=args[i];
+      if(a&&typeof a==='object'){ try{ a=JSON.stringify(a); }catch(e){ a='[object]'; } }
+      parts.push(String(a));
+    }
+    window.__vegaNativeTrace(level+': '+parts.join(' ').slice(0,500));
+  }catch(e){}
+};
+['log','warn','error','info','debug'].forEach(function(lv){
+  try{ console[lv]=function(){ window.__vegaConsole(lv,arguments); }; }catch(e){}
+});
+
+// ---- invoke ----
+/* Android's evaluateJavascript does NOT await a returned Promise: it serialises
+   the return value straight away, so a Promise arrives as `{}` — which decoded
+   to a null payload and surfaced as "non-array: null" no matter what the provider
+   returned. Push the result into the native bridge instead and return at once. */
+window.__vegaDone=function(payload){
+  try{ if(window.VegaHttp&&window.VegaHttp.result) window.VegaHttp.result(String(payload)); }
+  catch(e){}
+};
+window.__vegaInvoke=function(exportName, args){
+  args=args||{};
+  __pv=String(args.providerValue||'');
+  var modExports=(window.__vegaModule&&window.__vegaModule.exports)||{};
+  var fn=modExports[exportName];
+  if(typeof fn!=='function'){
+    window.__vegaDone(JSON.stringify({__error:'missing export '+exportName}));
+    return 'started';
+  }
+  /* openWebView is how a provider asks the *user* to clear a Cloudflare
+     interstitial or click through a gate, and it expects the solved page back.
+     It is used 51 times across the real bundles and used to reject outright, so
+     every one of those call sites failed and roughly half the published
+     providers could never return a stream. It now routes to the visible WAF
+     screen and comes back with {data, cookies, cookieMap, userAgent, url}. */
+  var ctx={
+    axios:window.__axiosShim, cheerio:window.__cheerio, Crypto:window.__cryptoShim,
+    getBaseUrl:window.__getBaseUrl, commonHeaders:(args.commonHeaders)||{},
+    getCookies:function(url){ return __rpc('getCookies',{url:String(url||'')}); },
+    openWebView:function(url, options){
+      options=options||{};
+      return __rpc('openWebView',{
+        url:String(url||''),
+        waitForCookie: options.waitForCookie||'',
+        waitForLoad: !!options.waitForLoad
+      },0);
+    },
+    kvStore:window.__kvStore
+  };
+  var controller=new AbortController();
+  var budget=(args.timeoutMs)||120000;
+  var timer=setTimeout(function(){
+    try{ controller.abort(); }catch(e){}
+    window.__vegaDone(JSON.stringify({__error:'Provider '+exportName+' timed out after '+
+      budget+'ms (the provider fetch never returned)'}));
+  },budget);
+  var callArgs=Object.assign({},(args.params)||{},{signal:controller.signal,providerContext:ctx});
+  window.__vegaConsole('info','invoke '+exportName+' params='+JSON.stringify((args.params)||{}));
+  Promise.resolve().then(function(){ return fn(callArgs); }).then(
+    function(r){
+      clearTimeout(timer);
+      var t=(r===undefined)?'undefined':(r===null?'null':Array.isArray(r)?'array('+r.length+')':typeof r);
+      window.__vegaConsole('info','invoke '+exportName+' -> '+t);
+      /* providerGlobal survives across invokes on mobile (fresh worker per call,
+         state handed in and returned). Push it natively before the result so
+         the host has it when the invoke settles — the bridge calls are ordered,
+         and a provider mutation must not be lost just because the app moved on. */
+      try{ if(window.VegaHttp&&window.VegaHttp.state) window.VegaHttp.state(JSON.stringify(window.providerGlobal||{})); }catch(e){}
+      window.__vegaDone(JSON.stringify({__ok:(r===undefined?null:r)}));
+    },
+    function(e){
+      clearTimeout(timer);
+      window.__vegaConsole('error','invoke '+exportName+' threw: '+String((e&&e.message||e)));
+      window.__vegaDone(JSON.stringify({__error:String((e&&e.message||e))}));
+    }
+  );
+  return 'started';
+};
+</script></body></html>

@@ -1,0 +1,13 @@
+<resources>
+    <string name="app_name">Vega TV</string>
+    <string name="search_hint">Search movies, shows…</string>
+    <string name="loading">Loading…</string>
+    <string name="retry">Retry</string>
+    <string name="no_results">Nothing found</string>
+    <string name="servers">Servers</string>
+    <string name="quality">Quality</string>
+    <string name="audio">Audio</string>
+    <string name="subtitles">Subtitles</string>
+    <string name="next_episode">Next episode</string>
+    <string name="episodes">Episodes</string>
+</resources>

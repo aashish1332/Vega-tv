@@ -1,0 +1,16 @@
+# suppress inspection "MissingProjectRoot" for whole file
+*.iml
+.gradle/
+.kotlin/
+local.properties
+.idea/
+.DS_Store
+build/
+/app/build/
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+*.hprof
+*.keystore
+*.jks
