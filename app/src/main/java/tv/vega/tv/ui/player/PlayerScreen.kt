@@ -107,6 +107,7 @@ import tv.vega.tv.data.diag.DiagLog
 import tv.vega.tv.data.history.WatchEntry
 import tv.vega.tv.data.net.NetClients
 import tv.vega.tv.data.model.VegaStream
+import tv.vega.tv.data.model.identityKey
 import tv.vega.tv.player.PlaybackSession
 import tv.vega.tv.player.PlayerKeyBus
 import tv.vega.tv.player.isMovieInfo
@@ -1005,6 +1006,14 @@ fun PlayerScreen(
                     delay(200)
                 }
                 failoverLabel = null
+            }
+
+            // Remember which labelled server/quality is actually on screen.
+            // History stores the label pair rather than the URL because links
+            // rotate between resolves; the next resume uses it to start on the
+            // same server instead of silently jumping to the best one.
+            LaunchedEffect(sel.link) {
+                PlaybackSession.playingStreamKey = sel.identityKey()
             }
 
             // A reloaded source that keeps playing earns every server back:
@@ -3020,19 +3029,33 @@ private suspend fun saveProgress(pos: Long, dur: Long, sync: Boolean = false) {
         // while the same title played from its feed.
         val playable = ep?.link?.takeIf { it.isNotBlank() }
             ?: PlaybackSession.pendingLink
+        val title = PlaybackSession.title.ifBlank { PlaybackSession.pendingTitle }
+        val episodeTitle = ep?.title ?: PlaybackSession.pendingEpisodeTitle
+        val provider = ServiceLocator.providers.active()?.ext?.value.orEmpty()
+        val mediaType = PlaybackSession.info?.type
+            ?.takeIf { it.isNotBlank() }
+            ?: PlaybackSession.pendingType
         ServiceLocator.history.upsert(
             WatchEntry(
                 mediaId = playable.ifBlank { return },
-                title = PlaybackSession.title.ifBlank { PlaybackSession.pendingTitle },
-                episodeTitle = ep?.title ?: PlaybackSession.pendingEpisodeTitle,
+                title = title,
+                episodeTitle = episodeTitle,
                 posterUrl = PlaybackSession.posterUrl.ifBlank { PlaybackSession.pendingPoster },
                 positionMs = pos, durationMs = dur, updatedAt = System.currentTimeMillis(),
                 link = playable,
-                provider = ServiceLocator.providers.active()?.ext?.value.orEmpty(),
+                provider = provider,
                 episodeIndex = PlaybackSession.startIndex,
-                mediaType = PlaybackSession.info?.type
-                    ?.takeIf { it.isNotBlank() }
-                    ?: PlaybackSession.pendingType,
+                mediaType = mediaType,
+                // One row per title/episode across server, quality and URL
+                // changes. The link is mutable playback state, not identity.
+                historyKey = tv.vega.tv.data.history.WatchHistoryStore.keyOf(
+                    provider, title, episodeTitle, PlaybackSession.startIndex,
+                ),
+                // Keep every known server/quality and the movie quality cards
+                // so a resume offers the whole list, not only the last pick.
+                streams = PlaybackSession.streams,
+                qualityLinks = PlaybackSession.qualityAlternates,
+                lastStreamKey = PlaybackSession.playingStreamKey,
             ),
         )
         // A periodic checkpoint is a local DataStore write only. Publishing a

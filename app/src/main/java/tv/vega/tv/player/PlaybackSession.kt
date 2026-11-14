@@ -2,9 +2,11 @@ package tv.vega.tv.player
 
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.serialization.Serializable
 import tv.vega.tv.data.model.EpisodeItem
 import tv.vega.tv.data.model.SeasonEntry
 import tv.vega.tv.data.model.VegaInfo
+import tv.vega.tv.data.model.VegaStream
 
 object PlaybackSession {
     private val _playerActive = MutableStateFlow(false)
@@ -69,6 +71,22 @@ object PlaybackSession {
     // entry instead of as a stream rendition. Those links are alternatives to
     // the currently playing item, so the player's Quality tab lists them.
     var qualityAlternates: List<QualityLink> = emptyList()
+    /**
+     * The server/quality list the player is actually showing. History saves
+     * this whole list, not just the playing link, so a resume can offer every
+     * server instead of only the last one.
+     */
+    var streams: List<VegaStream> = emptyList()
+    /**
+     * Streams restored from a Continue Watching row. They are merged with the
+     * fresh provider resolve (fresh links win) and used as a fallback when the
+     * provider call fails, so an expiring mirror URL never strands a resume.
+     */
+    var savedStreams: List<VegaStream> = emptyList()
+    /** Server+quality that was playing; fresh URLs may differ. */
+    var preferredStreamKey: String = ""
+    /** Updated by the player for the stream actually on screen. */
+    var playingStreamKey: String = ""
 
     fun set(
         title: String,
@@ -95,6 +113,10 @@ object PlaybackSession {
         this.pendingType = info?.type.orEmpty()
         this.pendingEpisodeTitle = ""
         this.qualityAlternates = qualityAlternates
+        this.streams = emptyList()
+        this.savedStreams = emptyList()
+        this.preferredStreamKey = ""
+        this.playingStreamKey = ""
     }
 }
 
@@ -135,6 +157,7 @@ fun qualityScore(label: String): Int =
     qualityTier(label) * 1_000_000 + qualitySizeMb(label).coerceIn(0, 999_999)
 
 /** One provider-named rendition of the same title, as a whole alternate link. */
+@Serializable
 data class QualityLink(val label: String, val link: String)
 
 /** "S01E02" / "Episode 12" — a title that names an episode, not a rendition. */

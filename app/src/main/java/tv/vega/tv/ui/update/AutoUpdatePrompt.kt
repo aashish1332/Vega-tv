@@ -39,6 +39,9 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.tv.material3.Button
 import androidx.tv.material3.MaterialTheme
 import androidx.tv.material3.Text
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import tv.vega.tv.data.providers.WafCoordinator
@@ -77,6 +80,7 @@ fun AutoUpdatePrompt() {
     var progress by remember { mutableStateOf<Pair<Long, Long>?>(null) }
     var note by remember { mutableStateOf<String?>(null) }
     var pendingInstall by remember { mutableStateOf<File?>(null) }
+    var downloadJob by remember { mutableStateOf<Job?>(null) }
 
     val playing by PlaybackSession.playerActiveFlow.collectAsStateWithLifecycle()
     val waf by WafCoordinator.pending.collectAsStateWithLifecycle()
@@ -118,14 +122,32 @@ fun AutoUpdatePrompt() {
     }
 
     LaunchedEffect(Unit) {
-        // Let the splash, the feed and the first focus settle first; an update
-        // dialog competing with the home screen is exactly the kind of popup a
-        // TV app should not have.
-        delay(6_000)
-        val latest = runCatching { UpdateApi.latest() }.getOrNull() ?: return@LaunchedEffect
+        // Start the GitHub check at launch, but do not put a dialog on top of
+        // the splash. The splash is 600 ms plus a 140 ms fade; once that is
+        // over, the release notice belongs to the first home frame. The two
+        // run in parallel, so a slow network does not push the notice later
+        // than the response itself.
+        val request = async { runCatching { UpdateApi.latest() }.getOrNull() }
+        delay(800)
+        val latest = request.await() ?: return@LaunchedEffect
         if (!UpdateApi.isNewer(latest.tag, "v$version")) return@LaunchedEffect
         if (latest.apkUrl.isNullOrBlank()) return@LaunchedEffect
         release = latest
+    }
+
+    fun cancelDownload() {
+        downloadJob?.cancel()
+        downloadJob = null
+        downloading = false
+        progress = null
+    }
+
+    fun dismiss() {
+        // Cancel is a real cancel: a download that keeps running after the
+        // notice is gone would open the installer at an arbitrary moment,
+        // possibly over playback.
+        cancelDownload()
+        dismissed = true
     }
 
     val offer = release
@@ -139,7 +161,7 @@ fun AutoUpdatePrompt() {
     val downloaded = progress
 
     Dialog(
-        onDismissRequest = { if (!downloading) dismissed = true },
+        onDismissRequest = { dismiss() },
         properties = DialogProperties(usePlatformDefaultWidth = false),
     ) {
         Column(
@@ -209,20 +231,26 @@ fun AutoUpdatePrompt() {
                         val url = offer.apkUrl ?: return@Button
                         downloading = true
                         note = null
-                        scope.launch {
+                        downloadJob = scope.launch {
                             progress = 0L to 0L
-                            runCatching {
-                                ApkUpdater.download(ctx, url, offer.apkName) { read, total ->
+                            try {
+                                val file = ApkUpdater.download(ctx, url, offer.apkName) { read, total ->
                                     progress = read to total
                                 }
-                            }.onSuccess { file ->
                                 progress = null
                                 downloading = false
-                                requestInstall(file)
-                            }.onFailure {
+                                downloadJob = null
+                                // A cancel that raced the final byte must win:
+                                // never open the installer behind the viewer's
+                                // back after the notice was dismissed.
+                                if (!dismissed) requestInstall(file)
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (e: Exception) {
                                 progress = null
                                 downloading = false
-                                note = "Download failed: ${it.message}"
+                                downloadJob = null
+                                if (!dismissed) note = "Download failed: ${e.message}"
                             }
                         }
                     },
@@ -230,8 +258,8 @@ fun AutoUpdatePrompt() {
                 ) {
                     Text(if (downloading) "Downloading…" else "Update now", maxLines = 1)
                 }
-                Button(onClick = { if (!downloading) dismissed = true }) {
-                    Text(if (downloading) "Hide" else "Later", maxLines = 1)
+                Button(onClick = { dismiss() }) {
+                    Text("Cancel", maxLines = 1)
                 }
             }
         }

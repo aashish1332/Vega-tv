@@ -14,9 +14,6 @@ import android.webkit.WebChromeClient
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
-import androidx.compose.foundation.background
-import androidx.compose.foundation.border
-import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -24,10 +21,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -43,17 +37,14 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
-import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
-import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.view.ViewCompat
@@ -73,6 +64,83 @@ import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.roundToInt
 
 private enum class NavMode { Page, Pointer }
+
+/**
+ * A DOM-drawn pointer.
+ *
+ * Compose content and a native WebView cannot be layered reliably: the
+ * AndroidView is a real child View and is painted after Compose's own draw
+ * pass, so a Compose cursor box behind it is invisible. The cursor therefore
+ * lives in the page itself, in a fixed, pointer-events:none element above
+ * every site layer (including cross-origin challenge iframes).
+ */
+private val PAGE_POINTER_JS = """
+    (function () {
+      if (window.__vegaPointerReady) return;
+      window.__vegaPointerReady = true;
+      var el = null;
+      function ensure() {
+        if (!el) {
+          el = document.createElement('div');
+          el.id = '__vega_pointer';
+          el.setAttribute('aria-hidden', 'true');
+          var s = el.style;
+          s.position = 'fixed';
+          s.left = '50%';
+          s.top = '50%';
+          s.width = '20px';
+          s.height = '20px';
+          s.marginLeft = '-10px';
+          s.marginTop = '-10px';
+          s.borderRadius = '50%';
+          s.border = '2px solid #ffffff';
+          s.background = 'rgba(8, 14, 24, 0.55)';
+          s.boxShadow = '0 0 0 2px #4da3ff, 0 2px 10px rgba(0,0,0,0.7)';
+          s.zIndex = '2147483647';
+          s.pointerEvents = 'none';
+          s.boxSizing = 'border-box';
+          s.display = 'none';
+        }
+        var root = document.documentElement || document.body;
+        if (root && el.parentNode !== root) root.appendChild(el);
+        return el;
+      }
+      window.__vegaPointerSet = function (x, y, w, h) {
+        var e = ensure();
+        if (!w || !h) return;
+        var cw = window.innerWidth || w;
+        var ch = window.innerHeight || h;
+        e.style.left = (x * cw / w) + 'px';
+        e.style.top = (y * ch / h) + 'px';
+        e.style.display = 'block';
+      };
+      window.__vegaPointerShow = function () { ensure().style.display = 'block'; };
+      window.__vegaPointerHide = function () { if (el) el.style.display = 'none'; };
+    })()
+""".trimIndent()
+
+/** Position the in-page cursor using WebView device pixels. */
+private fun WebView.setPageCursor(x: Float, y: Float) {
+    if (width <= 0 || height <= 0) return
+    val px = x.coerceIn(0f, (width - 1).coerceAtLeast(0).toFloat())
+    val py = y.coerceIn(0f, (height - 1).coerceAtLeast(0).toFloat())
+    runCatching {
+        evaluateJavascript(
+            "window.__vegaPointerSet&&window.__vegaPointerSet($px,$py,$width,$height)",
+            null,
+        )
+    }
+}
+
+private fun WebView.setPageCursorVisible(visible: Boolean) {
+    runCatching {
+        evaluateJavascript(
+            if (visible) "window.__vegaPointerShow&&window.__vegaPointerShow()"
+            else "window.__vegaPointerHide&&window.__vegaPointerHide()",
+            null,
+        )
+    }
+}
 
 private val ACTIVE_TEXT_FIELD_JS = """
     (function () {
@@ -388,7 +456,10 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
     var mode by remember { mutableStateOf(NavMode.Page) }
     val toolbarFocus = remember { FocusRequester() }
     val webViewFocus = remember { FocusRequester() }
-    val pointerFocus = remember { FocusRequester() }
+    // Pointer keys arrive on the WebView's key listener (the page always keeps
+    // real focus); this stable hook reaches the composable's cursor state.
+    val pointerKeyAction =
+        remember { AtomicReference<(Int, Int) -> Boolean>({ _, _ -> false }) }
     // The JS bridge runs on a binder thread; it can only hand work back to the
     // main thread through these stable hooks.
     val focusToolbarAction = remember { AtomicReference<() -> Unit>({}) }
@@ -398,7 +469,6 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
     val pointerStep = with(density) { 18.dp.toPx() }
     val pointerRepeatStep = with(density) { 9.dp.toPx() }
     val edgeScrollStep = with(density) { 28.dp.toPx() }
-    val pointerRadius = with(density) { 13.dp.toPx() }
     var cursorX by remember { mutableFloatStateOf(-1f) }
     var cursorY by remember { mutableFloatStateOf(-1f) }
     var areaWidth by remember { mutableStateOf(0) }
@@ -439,9 +509,7 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
         val imm = wv.context.getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
         imm?.hideSoftInputFromWindow(wv.windowToken, 0)
         ViewCompat.getWindowInsetsController(wv)?.hide(WindowInsetsCompat.Type.ime())
-        if (mode == NavMode.Pointer) {
-            wv.postDelayed({ runCatching { pointerFocus.requestFocus() } }, 120)
-        }
+        wv.requestFocus()
         return true
     }
 
@@ -511,6 +579,11 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
                 else cursorY = (cursorY + step).coerceAtMost(maxY)
             }
         }
+        // The cursor is painted by the page, not Compose, so it stays above
+        // the native WebView surface and over cross-origin challenge iframes.
+        if (wv != null && cursorX >= 0f && cursorY >= 0f) {
+            wv.setPageCursor(cursorX, cursorY)
+        }
     }
 
     fun tapAtCursor() {
@@ -533,17 +606,21 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
         }
     }
 
-    fun isPointerKeyCode(keyCode: Int): Boolean = when (keyCode) {
-        AndroidKeyEvent.KEYCODE_DPAD_LEFT,
-        AndroidKeyEvent.KEYCODE_DPAD_RIGHT,
-        AndroidKeyEvent.KEYCODE_DPAD_UP,
-        AndroidKeyEvent.KEYCODE_DPAD_DOWN,
-        AndroidKeyEvent.KEYCODE_DPAD_CENTER,
-        AndroidKeyEvent.KEYCODE_ENTER,
-        AndroidKeyEvent.KEYCODE_NUMPAD_ENTER,
-        AndroidKeyEvent.KEYCODE_BUTTON_A,
-        -> true
-        else -> false
+    pointerKeyAction.set { keyCode, repeatCount ->
+        mode == NavMode.Pointer && handlePointerKeyCode(keyCode, repeatCount)
+    }
+
+    /** Force the page cursor to the centre after a toolbar round trip. */
+    fun recenterPointer() {
+        val wv = webView ?: return
+        if (wv.width <= 0 || wv.height <= 0) return
+        cursorX = wv.width / 2f
+        cursorY = wv.height / 2f
+        if (mode == NavMode.Pointer) {
+            wv.setPageCursor(cursorX, cursorY)
+            wv.setPageCursorVisible(true)
+        }
+        wv.requestFocus()
     }
 
     /**
@@ -625,20 +702,24 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
         if (id != null && wv != null) WafCoordinator.attach(id, wv)
     }
 
-    // Page mode owns the D-pad. Pointer mode moves focus to the overlay; when
-    // the user returns, the page gets it back without a recreate.
+    // Page mode and pointer mode both keep real focus on the WebView: pointer
+    // keys are intercepted by its key listener, and a Compose focus target
+    // cannot be trusted to stay above a native WebView.
     LaunchedEffect(pendingId, webView, mode) {
-        if (mode == NavMode.Pointer) {
-            repeat(3) {
-                withFrameNanos { }
-                if (runCatching { pointerFocus.requestFocus() }.isSuccess) return@LaunchedEffect
-            }
-            return@LaunchedEffect
-        }
         val wv = webView ?: return@LaunchedEffect
+        if (mode == NavMode.Pointer) {
+            if (cursorX < 0f || cursorY < 0f) {
+                cursorX = wv.width / 2f
+                cursorY = wv.height / 2f
+            }
+            wv.setPageCursor(cursorX, cursorY)
+            wv.setPageCursorVisible(true)
+        } else {
+            wv.setPageCursorVisible(false)
+        }
         repeat(3) {
             withFrameNanos { }
-            if (runCatching { wv.requestFocus() }.getOrDefault(false)) return@LaunchedEffect
+            if (wv.requestFocus()) return@LaunchedEffect
         }
     }
 
@@ -705,7 +786,17 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
                 )
             }
             Button(onClick = { focusFirstTextField() }) { Text("Keyboard", maxLines = 1) }
-            Button(onClick = { mode = if (mode == NavMode.Page) NavMode.Pointer else NavMode.Page }) {
+            Button(onClick = {
+                if (mode == NavMode.Page) {
+                    mode = NavMode.Pointer
+                    // The page just had focus (or the toolbar did): put the
+                    // pointer mid-page and hand focus back immediately instead
+                    // of waiting for the next recomposition pass.
+                    recenterPointer()
+                } else {
+                    mode = NavMode.Page
+                }
+            }) {
                 Text(if (mode == NavMode.Page) "Pointer" else "Page", maxLines = 1)
             }
             Button(onClick = { tapVerificationBox() }) { Text("Tap check", maxLines = 1) }
@@ -737,7 +828,20 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
             maxLines = 1,
             modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 2.dp),
         )
-        Box(Modifier.fillMaxSize().weight(1f)) {
+        Box(
+            Modifier.fillMaxSize().weight(1f).onSizeChanged { size ->
+                areaWidth = size.width
+                areaHeight = size.height
+                if (cursorX < 0f || cursorY < 0f) {
+                    cursorX = size.width / 2f
+                    cursorY = size.height / 2f
+                } else {
+                    cursorX = cursorX.coerceIn(0f, (size.width - 1).coerceAtLeast(0).toFloat())
+                    cursorY = cursorY.coerceIn(0f, (size.height - 1).coerceAtLeast(0).toFloat())
+                }
+                if (mode == NavMode.Pointer) webView?.setPageCursor(cursorX, cursorY)
+            },
+        ) {
             key(challenge?.id) {
                 AndroidView(
                     factory = { c ->
@@ -752,6 +856,12 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
                             isFocusableInTouchMode = true
                             setOnKeyListener { _, keyCode, event ->
                                 if (event.action == AndroidKeyEvent.ACTION_DOWN &&
+                                    pointerKeyAction.get().invoke(keyCode, event.repeatCount)
+                                ) {
+                                    // Pointer mode owns the D-pad; the page must
+                                    // not also run its focus navigation.
+                                    true
+                                } else if (event.action == AndroidKeyEvent.ACTION_DOWN &&
                                     (keyCode == AndroidKeyEvent.KEYCODE_MENU ||
                                         keyCode == AndroidKeyEvent.KEYCODE_BUTTON_Y)
                                 ) {
@@ -850,6 +960,18 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
                                         view?.evaluateJavascript(it, null)
                                     }
                                     view?.evaluateJavascript(SPATIAL_NAV_JS, null)
+                                    // The pointer element must exist before the
+                                    // first D-pad press; its coordinates are
+                                    // kept in native state and re-applied here.
+                                    view?.evaluateJavascript(PAGE_POINTER_JS, null)
+                                    if (view != null && mode == NavMode.Pointer) {
+                                        if (cursorX < 0f || cursorY < 0f) {
+                                            cursorX = view.width / 2f
+                                            cursorY = view.height / 2f
+                                        }
+                                        view.setPageCursor(cursorX, cursorY)
+                                        view.setPageCursorVisible(true)
+                                    }
                                     if (!done) {
                                         status = when {
                                             pendingId == null -> "Complete the check, then press Continue"
@@ -888,57 +1010,6 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
                         if (webView === view) webView = null
                     },
                 )
-            }
-            if (mode == NavMode.Pointer) {
-                Box(
-                    Modifier.fillMaxSize()
-                        .onSizeChanged { size ->
-                            areaWidth = size.width
-                            areaHeight = size.height
-                            if (cursorX < 0f || cursorY < 0f) {
-                                cursorX = size.width / 2f
-                                cursorY = size.height / 2f
-                            } else {
-                                cursorX = cursorX.coerceIn(0f, (size.width - 1).coerceAtLeast(0).toFloat())
-                                cursorY = cursorY.coerceIn(0f, (size.height - 1).coerceAtLeast(0).toFloat())
-                            }
-                        }
-                        .focusRequester(pointerFocus)
-                        .onKeyEvent { event ->
-                            if (event.type != KeyEventType.KeyDown) return@onKeyEvent false
-                            val keyCode = when (event.key) {
-                                Key.DirectionLeft -> AndroidKeyEvent.KEYCODE_DPAD_LEFT
-                                Key.DirectionRight -> AndroidKeyEvent.KEYCODE_DPAD_RIGHT
-                                Key.DirectionUp -> AndroidKeyEvent.KEYCODE_DPAD_UP
-                                Key.DirectionDown -> AndroidKeyEvent.KEYCODE_DPAD_DOWN
-                                Key.DirectionCenter -> AndroidKeyEvent.KEYCODE_DPAD_CENTER
-                                Key.Enter -> AndroidKeyEvent.KEYCODE_ENTER
-                                Key.NumPadEnter -> AndroidKeyEvent.KEYCODE_NUMPAD_ENTER
-                                Key.ButtonA -> AndroidKeyEvent.KEYCODE_BUTTON_A
-                                else -> return@onKeyEvent false
-                            }
-                            handlePointerKeyCode(keyCode, event.nativeKeyEvent.repeatCount)
-                        }
-                        .focusable(),
-                ) {
-                    if (cursorX >= 0f && cursorY >= 0f) {
-                        Box(
-                            Modifier
-                                .offset {
-                                    IntOffset(
-                                        (cursorX - pointerRadius).roundToInt(),
-                                        (cursorY - pointerRadius).roundToInt(),
-                                    )
-                                }
-                                .size(26.dp)
-                                .background(Color.Black.copy(alpha = 0.55f), CircleShape)
-                                .border(2.dp, Color.White, CircleShape),
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            Box(Modifier.size(6.dp).background(Color.White, CircleShape))
-                        }
-                    }
-                }
             }
         }
     }

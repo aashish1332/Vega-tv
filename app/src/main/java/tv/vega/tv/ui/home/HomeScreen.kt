@@ -61,6 +61,7 @@ import tv.vega.tv.data.ServiceLocator
 import tv.vega.tv.data.history.WatchEntry
 import tv.vega.tv.data.history.WatchHistoryStore
 import tv.vega.tv.data.model.VegaPost
+import tv.vega.tv.data.model.identityKey
 import tv.vega.tv.player.PlaybackSession
 import tv.vega.tv.ui.common.ErrorScreen
 import tv.vega.tv.ui.common.LoadingScreen
@@ -245,9 +246,10 @@ fun HomeScreen(
                             ) {
                                 items(
                                     continueWatching,
-                                    key = { it.mediaId },
+                                    key = { it.historyKey.ifBlank { it.mediaId } },
                                     contentType = { "resume" },
                                 ) { e ->
+                                    val entryKey = e.historyKey.ifBlank { e.mediaId }
                                     ResumeCard(
                                         title = e.title,
                                         poster = e.posterUrl.ifBlank { null },
@@ -255,7 +257,7 @@ fun HomeScreen(
                                         progress = WatchHistoryStore.progressFraction(e),
                                         onClick = {
                                             val clickAfterLongPress =
-                                                longPressedId == e.mediaId &&
+                                                longPressedId == entryKey &&
                                                     System.currentTimeMillis() - longPressedAt < 3000L
                                             if (!clickAfterLongPress) {
                                                 // Playback directly: no catalog
@@ -270,10 +272,12 @@ fun HomeScreen(
                                             // are one locked operation; removing
                                             // only the DataStore row let the next
                                             // shared-folder merge re-add the card.
-                                            longPressedId = e.mediaId
+                                            longPressedId = entryKey
                                             longPressedAt = System.currentTimeMillis()
                                             scope.launch {
-                                                ServiceLocator.sync.removeHistory(e.mediaId, e.link)
+                                                ServiceLocator.sync.removeHistory(
+                                                    e.mediaId, e.link, entryKey,
+                                                )
                                             }
                                         },
                                     )
@@ -441,7 +445,17 @@ private fun resumeEntry(e: WatchEntry, onPlayEntry: () -> Unit) {
     PlaybackSession.episodes = emptyList()
     PlaybackSession.startIndex = e.episodeIndex.coerceAtLeast(0)
     PlaybackSession.info = null
-    PlaybackSession.qualityAlternates = emptyList()
+    // Restore the complete server/quality picture saved with the row. The
+    // player merges these with the fresh resolve (new links win) and falls
+    // back to them if the provider call fails, so a resume never collapses to
+    // the single mirror that happened to be playing last time.
+    PlaybackSession.streams = emptyList()
+    PlaybackSession.savedStreams = e.streams
+    PlaybackSession.qualityAlternates = e.qualityLinks
+    PlaybackSession.preferredStreamKey = e.lastStreamKey.ifBlank {
+        e.streams.firstOrNull { it.link == playable }?.identityKey().orEmpty()
+    }
+    PlaybackSession.playingStreamKey = PlaybackSession.preferredStreamKey
     PlaybackSession.pendingLink = link
     // If the stored identity is still a post page, PlayerViewModel can heal it
     // with one getMeta call instead of failing with a retry button.

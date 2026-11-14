@@ -5,11 +5,13 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import android.webkit.WebView
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
@@ -19,6 +21,9 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
 private const val TAG = "VegaProvider"
+
+/** Marker in provider_runtime.html replaced with the bundled cheerio source. */
+private const val CHEERIO_MARKER = "/*__VEGA_CHEERIO_BUNDLE__*/"
 
 /**
  * Upstream `SANDBOX_INVOKE_TIMEOUT_MS`. The port used 25s, which is not enough
@@ -50,6 +55,35 @@ class ProviderJs(appContext: Context) {
     private val main = Handler(Looper.getMainLooper())
     private var web: WebView? = null
     private var runtimeReadyFor: String? = null
+
+    /**
+     * Real cheerio, read once from assets and inlined into every realm.
+     *
+     * The official sandbox hands providers `import * as cheerio`; bundles call
+     * `$.html()`, `el.clone()`, `:contains`, traversal and mutation. A DOM
+     * shim cannot keep up with that surface (RareAnimes failed on `$.html`,
+     * HDHub4u on `el.clone`), so this is the actual browser build.
+     */
+    private val cheerioBundle: String by lazy {
+        runCatching {
+            ctx.assets.open("cheerio.bundle.js").bufferedReader().use { it.readText() }
+        }.getOrElse {
+            Log.e(TAG, "cheerio bundle missing; using DOM shim: ${it.message}")
+            ""
+        }
+    }
+
+    /**
+     * The runtime page with cheerio already inlined, built once per process.
+     * `loadDataWithBaseURL` cannot resolve a relative `<script src>` to APK
+     * assets, so the 336 KB bundle has to be part of the HTML string. Caching
+     * the final page keeps a provider switch off the main thread's allocation
+     * path after the first load.
+     */
+    private val runtimeHtml: String by lazy {
+        val base = ctx.assets.open("provider_runtime.html").bufferedReader().use { it.readText() }
+        base.replace(CHEERIO_MARKER, cheerioBundle)
+    }
 
     /** True while [invoke] holds the realm; teardown must not cut one in half. */
     @Volatile
@@ -176,7 +210,12 @@ class ProviderJs(appContext: Context) {
     private suspend fun ensureRuntime(providerKey: String) {
         if (web != null && runtimeReadyFor == providerKey) return
         val w = webView()
-        val html = ctx.assets.open("provider_runtime.html").bufferedReader().use { it.readText() }
+        // Inline the 336KB cheerio browser bundle instead of a <script src>:
+        // the page is loaded with loadDataWithBaseURL, so a relative asset URL
+        // would resolve to https://localhost/ and never reach the APK assets.
+        // Build it off the main thread; on a weak TV a 350KB asset read plus a
+        // 380KB string allocation is frame-visible on the launch path.
+        val html = withContext(Dispatchers.IO) { runtimeHtml }
         val gen = ++loadGeneration
         suspendCancellableCoroutine<Unit> { cont ->
             main.post {

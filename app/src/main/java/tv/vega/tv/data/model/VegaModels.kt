@@ -80,6 +80,24 @@ data class VegaStream(
     val skip: List<SkipInterval> = emptyList(),
 )
 
+/**
+ * Identity of one played rendition across sessions.
+ *
+ * The URL is deliberately excluded when a server/quality label exists: the
+ * same mirror gets a fresh signed URL on every resolve, while the label pair
+ * stays stable. Entries with no labels fall back to the URL so two anonymous
+ * mirrors never collapse into one.
+ */
+fun VegaStream.identityKey(): String {
+    val server = server.trim().lowercase()
+    val quality = quality?.trim()?.lowercase().orEmpty()
+    return if (server.isNotEmpty() || quality.isNotEmpty()) {
+        "$server|$quality"
+    } else {
+        link.trim()
+    }
+}
+
 @Serializable
 data class DirectLink(
     val title: String = "",

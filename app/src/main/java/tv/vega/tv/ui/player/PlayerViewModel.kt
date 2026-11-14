@@ -9,6 +9,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import tv.vega.tv.data.ServiceLocator
 import tv.vega.tv.data.model.VegaStream
+import tv.vega.tv.data.model.identityKey
 import tv.vega.tv.player.PlaybackSession
 import tv.vega.tv.ui.common.UiState
 
@@ -159,6 +160,9 @@ class PlayerViewModel : ViewModel() {
         // says nothing about this one, and its rendition list can differ.
         userPicked = false
         index = 0
+        PlaybackSession.savedStreams = emptyList()
+        PlaybackSession.preferredStreamKey = ""
+        PlaybackSession.qualityAlternates = emptyList()
         load(advancing = true, step = delta)
     }
 
@@ -238,7 +242,14 @@ class PlayerViewModel : ViewModel() {
                 // whole file without a redirect/ad chain, so it is both the
                 // fastest to start and the least likely to rebuffer. Put its
                 // entries first and let the automatic pick stay inside them.
-                val streams = preferPixeldrain(resolved)
+                //
+                // Continue Watching also carries the last known server list.
+                // Merge it in after the fresh resolve: the provider's new URLs
+                // win per server/quality, while mirrors that the current call
+                // did not return remain selectable instead of disappearing.
+                val streams = preferPixeldrain(
+                    mergeSavedStreams(resolved, PlaybackSession.savedStreams),
+                )
                 if (advancing && streams.isEmpty()) {
                     fail(
                         advancing, step, prevIndex, prevUserPicked,
@@ -253,9 +264,13 @@ class PlayerViewModel : ViewModel() {
                 switchTargetLink = null
                 _nextError.value = null
                 _switching.value = null
+                val preferredIndex = streams.indexOfFirst {
+                    it.identityKey() == PlaybackSession.preferredStreamKey
+                }
                 when {
                     streams.isEmpty() -> autoSelect(0)
                     userPicked -> index = index.coerceIn(0, streams.lastIndex)
+                    preferredIndex >= 0 -> autoSelect(preferredIndex)
                     preferBest -> {
                         // After ordering, the Pixeldrain block is a prefix, so
                         // an index inside it is already an index into `streams`.
@@ -264,6 +279,7 @@ class PlayerViewModel : ViewModel() {
                     }
                     else -> index = index.coerceIn(0, streams.lastIndex)
                 }
+                PlaybackSession.streams = streams
                 _state.value = UiState.Success(streams)
             }
                 .onFailure { e ->
@@ -271,6 +287,28 @@ class PlayerViewModel : ViewModel() {
                         "Challenge required at ${e.host.ifBlank { "provider" }}"
                     } else {
                         e.message ?: "No streams"
+                    }
+                    // A resume must not dead-end because the provider API is
+                    // briefly down or the saved title link expired: the direct
+                    // mirror URLs saved with the history row are still playable
+                    // far more often than a Retry screen suggests. WAF is the
+                    // exception — that needs the viewer, not a stale URL.
+                    val saved = PlaybackSession.savedStreams
+                    if (!advancing &&
+                        saved.isNotEmpty() &&
+                        e !is tv.vega.tv.data.providers.ProviderManager.WafRequired
+                    ) {
+                        val streams = preferPixeldrain(saved)
+                        val preferred = streams.indexOfFirst {
+                            it.identityKey() == PlaybackSession.preferredStreamKey
+                        }
+                        autoSelect(
+                            if (preferred >= 0) preferred
+                            else bestIndexForDisplay(streams, maxPlaybackHeight),
+                        )
+                        PlaybackSession.streams = streams
+                        _state.value = UiState.Success(streams)
+                        return@onFailure
                     }
                     fail(advancing, step, prevIndex, prevUserPicked, message, e)
                 }
@@ -435,6 +473,22 @@ class PlayerViewModel : ViewModel() {
 /** Host of a stream link, or "" when it is not a parseable URL. */
 private fun streamHost(link: String): String =
     runCatching { java.net.URI(link).host.orEmpty() }.getOrDefault("")
+
+/**
+ * Fresh resolve first; any server/quality only the saved row knows about is
+ * appended. Comparison is by label pair, never by URL, because the same
+ * mirror gets a fresh signed link on every resolve.
+ */
+private fun mergeSavedStreams(
+    fresh: List<VegaStream>,
+    saved: List<VegaStream>,
+): List<VegaStream> {
+    if (saved.isEmpty()) return fresh
+    val out = fresh.toMutableList()
+    val seen = fresh.mapTo(HashSet()) { it.identityKey() }
+    saved.forEach { s -> if (seen.add(s.identityKey())) out.add(s) }
+    return out
+}
 
 /**
  * A stream served directly by Pixeldrain.

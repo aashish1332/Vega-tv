@@ -47,7 +47,9 @@ object ServiceLocator {
                     if (local == null || r.updatedAt > local.updatedAt) history.upsert(r)
                 }
             }
-            s.deleteHistory = { mediaId, link -> history.remove(mediaId, link) }
+            s.deleteHistory = { mediaId, link, historyKey ->
+                history.remove(mediaId, link, historyKey)
+            }
             s.applyWatchlist = { watchlist.replaceAll(it) }
         }
         repository = VegaRepository(app, providers, settings)

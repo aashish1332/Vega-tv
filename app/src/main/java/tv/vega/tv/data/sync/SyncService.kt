@@ -39,7 +39,7 @@ class SyncService(private val context: Context) {
     var watchlist: (suspend () -> List<WatchItem>)? = null
     var applyHistory: (suspend (List<WatchEntry>) -> Unit)? = null
     var applyWatchlist: (suspend (List<WatchItem>) -> Unit)? = null
-    var deleteHistory: (suspend (String, String) -> Unit)? = null
+    var deleteHistory: (suspend (String, String, String) -> Unit)? = null
 
     // A deletion must not race a shared-folder merge that still contains the
     // old manifest: otherwise the card vanishes, the merge re-adds it, and the
@@ -81,10 +81,15 @@ class SyncService(private val context: Context) {
      * manifest and put the card back. The tombstone is written first, under
      * the same lock as the merge, so an in-flight sync can never resurrect it.
      */
-    suspend fun removeHistory(mediaId: String, link: String = "") = withContext(Dispatchers.IO) {
+    suspend fun removeHistory(
+        mediaId: String,
+        link: String = "",
+        historyKey: String = "",
+    ) = withContext(Dispatchers.IO) {
         syncMutex.withLock {
             val entries = history?.invoke().orEmpty()
             val entry = entries.firstOrNull { it.mediaId == mediaId }
+                ?: entries.firstOrNull { historyKey.isNotBlank() && it.historyKey == historyKey }
                 ?: entries.firstOrNull { link.isNotBlank() && it.link == link }
             // The provider link is the stable identity across devices; the
             // media id can differ for the same episode (quality/source URL).
@@ -97,7 +102,7 @@ class SyncService(private val context: Context) {
                     deletedAt = System.currentTimeMillis(),
                 ),
             )
-            deleteHistory?.invoke(mediaId, key)
+            deleteHistory?.invoke(mediaId, key, historyKey)
             publishLocked()
         }
     }

@@ -1,9 +1,15 @@
 <!doctype html>
-<html><head><meta charset="utf-8"></head><body><script>
+<html><head><meta charset="utf-8"></head><body><script>/*__VEGA_CHEERIO_BUNDLE__*/</script><script>
 'use strict';
 /* Vega TV provider runtime: mirrors sandboxWorker shims (fetch/axios/
    cheerio/getBaseUrl/kv/Crypto) using the WebView's own network stack.
    One realm per provider (reloaded on switch), one invoke at a time. */
+
+/* cheerio arrives above as the real browser build (cheerio.bundle.js,
+   injected by ProviderJs). Providers are written against the upstream
+   sandbox and use the whole library — $.html(), node.clone(), traversal,
+   :contains, mutation — not a DOM subset. The shim below is only a
+   last-resort fallback if that asset is missing. */
 
 // ---- private-host guard (mirrors urlGuard.ts) ----
 function __isBlockedHost(h){
@@ -105,13 +111,13 @@ window.__vegaFetch = function(url, init){
 };
 window.fetch = window.__vegaFetch;
 
-// ---- cheerio shim (DOM-backed subset used by providers) ----
+// ---- cheerio shim (fallback only; the real bundle is injected above) ----
 /* Providers use the traversal half of cheerio, not just find(). The meta bundle
    in particular walks siblings — heading.next('p'), .prev(), .is(), .nextAll() —
    and the stream bundle uses the :contains() pseudo. None of that existed in
    the first version of this shim, which is why the catalog rendered and the
    detail screen died on "heading.next is not a function". */
-window.__cheerio = { load: function(html){
+if(!window.__cheerio) window.__cheerio = { load: function(html){
   var doc = new DOMParser().parseFromString(String(html==null?'':html), 'text/html');
   function norm(s){
     if(typeof s!=='string') return null;

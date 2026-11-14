@@ -4,7 +4,9 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import androidx.core.content.FileProvider
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import okhttp3.Request
 import tv.vega.tv.data.net.NetClients
@@ -35,23 +37,33 @@ object ApkUpdater {
             .replace(Regex("[^A-Za-z0-9._-]"), "_")
         val dest = File(dir, safeName)
         val req = Request.Builder().url(url).build()
-        NetClients.http.newCall(req).execute().use { r ->
-            require(r.isSuccessful) { "HTTP ${r.code}" }
-            val body = r.body ?: error("Empty response")
-            val total = body.contentLength()
-            body.byteStream().use { ins ->
-                dest.outputStream().use { out ->
-                    val buf = ByteArray(64 * 1024)
-                    var read = 0L
-                    while (true) {
-                        val n = ins.read(buf)
-                        if (n <= 0) break
-                        out.write(buf, 0, n)
-                        read += n
-                        onProgress(read, total)
+        try {
+            NetClients.http.newCall(req).execute().use { r ->
+                require(r.isSuccessful) { "HTTP ${r.code}" }
+                val body = r.body ?: error("Empty response")
+                val total = body.contentLength()
+                body.byteStream().use { ins ->
+                    dest.outputStream().use { out ->
+                        val buf = ByteArray(64 * 1024)
+                        var read = 0L
+                        while (true) {
+                            // Cancel must stop a large APK promptly: otherwise
+                            // the "Cancel" button only hides the notice while
+                            // the whole file keeps downloading in the
+                            // background.
+                            ensureActive()
+                            val n = ins.read(buf)
+                            if (n <= 0) break
+                            out.write(buf, 0, n)
+                            read += n
+                            onProgress(read, total)
+                        }
                     }
                 }
             }
+        } catch (e: CancellationException) {
+            dest.delete()
+            throw e
         }
         dest
     }
