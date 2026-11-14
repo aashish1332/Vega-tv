@@ -1,6 +1,8 @@
 package tv.vega.tv.data.providers
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import okhttp3.Request
@@ -41,10 +43,13 @@ class ProviderApi(
                 .url(manifestUrl)
                 .header("Cache-Control", if (force) "no-cache" else "max-age=3600")
                 .build()
+            currentCoroutineContext().ensureActive()
             val resp = client(10).newCall(req).execute()
+            currentCoroutineContext().ensureActive()
             if (resp.code == 403 || resp.code == 429) throw ProviderRateLimited()
             require(resp.isSuccessful) { "Manifest fetch failed: HTTP ${resp.code}" }
             val body = resp.body?.string().orEmpty()
+            resp.close()
             require(body.length < 2 * 1024 * 1024) { "Manifest too large" }
             val list = json.decodeFromString<List<ProviderExtension>>(body)
                 // A path that leaves the source folder is unsafe; skip that entry.
@@ -66,10 +71,17 @@ class ProviderApi(
             val got = mutableMapOf<String, String?>()
             val base = ProviderUrls.filesUrl(source.url, ext.value, ext.path)
             for ((kind, required) in kinds) {
+                // Player start cancels this coroutine. A blocking execute cannot
+                // be interrupted, so re-check immediately after it returns and
+                // before any module is written: a partially updated provider is
+                // worse than an old one.
+                currentCoroutineContext().ensureActive()
                 val url = "$base/$kind.js?t=${System.currentTimeMillis()}"
                 try {
                     val req = Request.Builder().url(url).header("Cache-Control", "no-cache").build()
-                    client(15).newCall(req).execute().use { resp ->
+                    val call = client(15).newCall(req)
+                    call.execute().use { resp ->
+                        currentCoroutineContext().ensureActive()
                         if (!resp.isSuccessful) {
                             if (required) throw ProviderModuleMissing("$kind: HTTP ${resp.code}")
                             got[kind] = null
@@ -86,6 +98,7 @@ class ProviderApi(
                     got[kind] = null
                 }
             }
+            currentCoroutineContext().ensureActive()
             store.putModule(
                 ProviderModules(
                     value = ext.value, sourceAuthor = source.author, version = ext.version,

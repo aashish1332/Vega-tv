@@ -8,9 +8,14 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -48,9 +53,12 @@ fun VegaCard(
     badge: String? = null,
     aspectRatio: Float = 2f / 3f,
 ) {
+    // Drives the title marquee: only the card the remote is sitting on scrolls
+    // its name, and it scrolls only while the name is wider than the card.
+    var focused by remember { mutableStateOf(false) }
     Card(
         onClick = onClick,
-        modifier = modifier.fillMaxWidth(),
+        modifier = modifier.fillMaxWidth().onFocusChanged { focused = it.isFocused },
         border = CardDefaults.border(
             border = Border(
                 border = androidx.compose.foundation.BorderStroke(1.dp, VegaOutlineVariant),
@@ -128,13 +136,12 @@ fun VegaCard(
                 )
             }
         }
-        Text(
-            title,
+        MarqueeText(
+            text = title,
+            active = focused,
             style = MaterialTheme.typography.bodyMedium,
             fontWeight = FontWeight.Medium,
             color = MaterialTheme.colorScheme.onSurface,
-            maxLines = 2,
-            overflow = TextOverflow.Ellipsis,
             modifier = Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 2.dp),
         )
         if (!subtitle.isNullOrBlank()) {

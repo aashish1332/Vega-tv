@@ -10,6 +10,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import tv.vega.tv.data.net.NetClients
+import java.util.concurrent.TimeUnit
 
 private const val TAG = "VegaProviderHttp"
 
@@ -49,10 +50,28 @@ private val HOP_BY_HOP = setOf(
  */
 class ProviderHttp {
 
+    /**
+     * Calls currently blocked in [fetch]. A teardown can cancel these instead
+     * of waiting for a provider's own 45–120s request budget to expire.
+     */
+    private val activeCalls = java.util.concurrent.ConcurrentHashMap<okhttp3.Call, Boolean>()
+
+    @Volatile
+    private var cancelled = false
+
+    fun cancelActiveCalls() {
+        cancelled = true
+        activeCalls.keys.forEach { runCatching { it.cancel() } }
+        activeCalls.clear()
+    }
+
     @JavascriptInterface
     fun fetch(reqJson: String): String {
         var req: JSONObject? = null
         return try {
+            // A provider that retries after teardown must not resurrect a
+            // network stream the player is about to compete with.
+            if (cancelled) error("request cancelled for playback")
             req = JSONObject(reqJson)
             val url = req.optString("url").ifBlank { error("missing url") }
             val method = (req.optString("method").ifBlank { "GET" }).uppercase()
@@ -85,32 +104,40 @@ class ProviderHttp {
                 .method(method, if (method in setOf("GET", "HEAD")) null else body ?: ByteArray(0).toRequestBody(null))
                 .build()
 
-            val response = NetClients.http.newCall(request).execute()
-            response.use { r ->
-                val bytes = r.body?.bytes() ?: ByteArray(0)
-                if (bytes.size > MAX_BODY) error("Response too large: ${bytes.size} bytes")
-                Log.i(TAG, "$method $url -> ${r.code} (${bytes.size}b)")
-                // Set-Cookie must reach CookieManager, or a Cloudflare clearance
-                // earned here is invisible to the next request and to the challenge
-                // WebView — which is how a solved challenge keeps re-appearing.
-                r.headers.values("set-cookie").forEach { c ->
-                    runCatching { CookieManager.getInstance().setCookie(url, c) }
+            val call = NetClients.http.newCall(request)
+            activeCalls[call] = true
+            try {
+                val timeoutMs = req.optLong("timeoutMs", 0L)
+                if (timeoutMs > 0) call.timeout().timeout(timeoutMs, TimeUnit.MILLISECONDS)
+                val response = call.execute()
+                response.use { r ->
+                    val bytes = r.body?.bytes() ?: ByteArray(0)
+                    if (bytes.size > MAX_BODY) error("Response too large: ${bytes.size} bytes")
+                    Log.i(TAG, "$method $url -> ${r.code} (${bytes.size}b)")
+                    // Set-Cookie must reach CookieManager, or a Cloudflare clearance
+                    // earned here is invisible to the next request and to the challenge
+                    // WebView — which is how a solved challenge keeps re-appearing.
+                    r.headers.values("set-cookie").forEach { c ->
+                        runCatching { CookieManager.getInstance().setCookie(url, c) }
+                    }
+                    JSONObject().apply {
+                        put("ok", true)
+                        put("status", r.code)
+                        put("statusText", r.message)
+                        put("url", r.request.url.toString())
+                        put("headers", JSONObject().apply {
+                            r.headers.forEach { h ->
+                                // OkHttp already decoded the body; forwarding these would
+                                // tell the JS Response the bytes are still compressed, and a
+                                // stale Content-Length contradicts what it actually got.
+                                if (!HOP_BY_HOP.contains(h.first.lowercase())) put(h.first, h.second)
+                            }
+                        })
+                        put("bodyBase64", Base64.encodeToString(bytes, Base64.NO_WRAP))
+                    }.toString()
                 }
-                JSONObject().apply {
-                    put("ok", true)
-                    put("status", r.code)
-                    put("statusText", r.message)
-                    put("url", r.request.url.toString())
-                    put("headers", JSONObject().apply {
-                        r.headers.forEach { h ->
-                            // OkHttp already decoded the body; forwarding these would
-                            // tell the JS Response the bytes are still compressed, and a
-                            // stale Content-Length contradicts what it actually got.
-                            if (!HOP_BY_HOP.contains(h.first.lowercase())) put(h.first, h.second)
-                        }
-                    })
-                    put("bodyBase64", Base64.encodeToString(bytes, Base64.NO_WRAP))
-                }.toString()
+            } finally {
+                activeCalls.remove(call)
             }
         } catch (e: Exception) {
             val msg = e.message ?: e.javaClass.simpleName
@@ -128,11 +155,17 @@ class ProviderHttp {
      * Provider invoke completion. evaluateJavascript cannot return a promise, so
      * JS pushes the result here instead; [ProviderJs] awaits it. Delivered on a
      * background thread, hence the volatile hook rather than direct state.
+     *
+     * [id] correlates the payload with the invoke that produced it. A cancelled
+     * Kotlin invoke cannot stop the JS promise it already started (the fetch may
+     * be in a synchronous native call), so that orphan can still push a result
+     * after the next invoke is waiting. Without the id it completed the *next*
+     * invoke's deferred and every result lagged one query behind its search.
      */
     @JavascriptInterface
-    fun result(payload: String) {
-        Log.i(TAG, "invoke result: ${payload.length} chars")
-        onResult?.invoke(payload)
+    fun result(id: String, payload: String) {
+        Log.i(TAG, "invoke result $id: ${payload.length} chars")
+        onResult?.invoke(id, payload)
     }
 
     /**
@@ -145,8 +178,13 @@ class ProviderHttp {
     @Volatile
     var stateCapture: String? = null
 
+    /** Id of the invoke that produced [stateCapture]; orphans are ignored. */
+    @Volatile
+    var stateCaptureId: String? = null
+
     @JavascriptInterface
-    fun state(payload: String) {
+    fun state(id: String, payload: String) {
+        stateCaptureId = id
         stateCapture = payload
     }
 
@@ -470,6 +508,15 @@ class ProviderHttp {
             url = url,
             waitForCookie = args.optString("waitForCookie").takeIf { it.isNotBlank() },
             waitForLoad = args.optBoolean("waitForLoad", false),
+            headers = args.optJSONObject("headers")?.let { h ->
+                buildMap {
+                    h.keys().forEach { k -> put(k, h.optString(k)) }
+                }
+            }.orEmpty(),
+            injectedJavaScript = args.optString("injectedJavaScript").takeIf { it.isNotBlank() },
+            timeoutMs = args.optLong("timeoutMs", 0L).coerceAtLeast(0L),
+            title = args.optString("title"),
+            description = args.optString("description"),
         )
         return JSONObject().put("ok", true).put("pending", true).put("requestId", requestId).toString()
     }
@@ -495,7 +542,16 @@ class ProviderHttp {
     private class RequestCounter { var id = 0L }
     private val requestCounter = RequestCounter()
 
-    internal data class OpenRequest(val url: String, val waitForCookie: String?, val waitForLoad: Boolean)
+    internal data class OpenRequest(
+        val url: String,
+        val waitForCookie: String?,
+        val waitForLoad: Boolean,
+        val headers: Map<String, String> = emptyMap(),
+        val injectedJavaScript: String? = null,
+        val timeoutMs: Long = 0L,
+        val title: String = "",
+        val description: String = "",
+    )
 
     internal val openRequests = java.util.concurrent.ConcurrentHashMap<Long, OpenRequest>()
     internal val openResults = java.util.concurrent.ConcurrentHashMap<Long, String>()
@@ -505,5 +561,5 @@ class ProviderHttp {
     var onTrace: ((String) -> Unit)? = null
 
     @Volatile
-    var onResult: ((String) -> Unit)? = null
+    var onResult: ((String, String) -> Unit)? = null
 }

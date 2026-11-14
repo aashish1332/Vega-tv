@@ -1,24 +1,35 @@
 package tv.vega.tv
 
+import android.content.Context
 import android.os.Bundle
 import android.view.KeyEvent
 import android.view.WindowManager
+import android.view.inputmethod.InputMethodManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
+import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
+import tv.vega.tv.data.providers.WafCoordinator
 import tv.vega.tv.player.PlaybackSession
 import tv.vega.tv.player.PlayerKeyBus
 import tv.vega.tv.ui.catalog.CatalogScreen
@@ -31,6 +42,7 @@ import tv.vega.tv.ui.search.SearchScreen
 import tv.vega.tv.ui.settings.SettingsScreen
 import tv.vega.tv.ui.splash.SplashScreen
 import tv.vega.tv.ui.theme.VegaTVTheme
+import tv.vega.tv.ui.update.AutoUpdatePrompt
 import tv.vega.tv.ui.waf.WafScreen
 import tv.vega.tv.ui.watchlist.WatchlistScreen
 
@@ -40,6 +52,12 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // The TV must not fall asleep on its own. Its inactivity detector
+        // cannot know a viewer is watching a paused frame or reading a long
+        // synopsis, and the screen going dark mid-session reads as a crash.
+        // Idle handling stays in-app (the player's own chrome hides itself);
+        // the display stays awake for as long as the app is on screen.
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         goFullscreen()
         setContent {
             VegaTVTheme {
@@ -83,12 +101,77 @@ class MainActivity : ComponentActivity() {
         if (hasFocus) goFullscreen()
     }
 
+    override fun onStart() {
+        super.onStart()
+        AppVisibility.isForeground = true
+    }
+
+    override fun onStop() {
+        AppVisibility.isForeground = false
+        super.onStop()
+    }
+
     override fun onResume() {
         super.onResume()
         goFullscreen()
     }
 
+    /**
+     * Playback keys must be offered to the player *before* Compose sees them.
+     *
+     * Spatial navigation consumes the D-pad arrows (and OK) inside the view
+     * tree whenever a control holds focus, so [onKeyDown] is never called for
+     * exactly the presses the player wants: LEFT/RIGHT on the scrubber, or a
+     * seek while the chrome is hidden. Dispatching here sees the key first;
+     * the player declines everything it does not own (returns false), and
+     * normal focus movement proceeds untouched. BACK and MENU stay in
+     * [onKeyDown] because they are navigation, not transport.
+     */
+    /**
+     * True while a challenge is visible, whether it is the coordinator's
+     * auto-opened dialog or the manual WAF route. The manual route has no
+     * pending call, and without this check the player sitting underneath would
+     * consume the D-pad before the challenge's WebView pointer sees it.
+     */
+    private fun wafOnScreen(): Boolean =
+        WafCoordinator.pending.value != null ||
+            nav?.currentDestination?.route?.startsWith("waf") == true
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (event.action == KeyEvent.ACTION_DOWN) {
+            when (event.keyCode) {
+                KeyEvent.KEYCODE_BACK,
+                KeyEvent.KEYCODE_MENU,
+                KeyEvent.KEYCODE_BUTTON_MODE,
+                -> Unit
+                else -> if (!wafOnScreen() &&
+                    PlayerKeyBus.onKey?.invoke(event.keyCode) == true
+                ) return true
+            }
+        }
+        return super.dispatchKeyEvent(event)
+    }
+
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        // The challenge dialog owns the remote; a key that leaked past it must
+        // not drive the player behind the modal. BACK closes the challenge.
+        val challenge = WafCoordinator.pending.value
+        if (wafOnScreen()) {
+            if (keyCode == KeyEvent.KEYCODE_BACK) {
+                // A keyboard opened by the sign-in page owns the first BACK.
+                if (ViewCompat.getRootWindowInsets(window.decorView)
+                        ?.isVisible(WindowInsetsCompat.Type.ime()) == true
+                ) {
+                    (getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager)
+                        ?.hideSoftInputFromWindow(window.decorView.windowToken, 0)
+                    return true
+                }
+                if (challenge != null) WafCoordinator.dismiss(challenge.id)
+                else nav?.popBackStack()
+                return true
+            }
+            return super.onKeyDown(keyCode, event)
+        }
         when (keyCode) {
             KeyEvent.KEYCODE_MENU, KeyEvent.KEYCODE_BUTTON_MODE -> {
                 PlayerKeyBus.onMenu?.let { it(); return true }
@@ -111,16 +194,6 @@ class MainActivity : ComponentActivity() {
                 backPressedAt = now
                 Toast.makeText(this, "Press BACK again to exit", Toast.LENGTH_SHORT).show()
                 return true
-            }
-            else -> {
-                // Playback keys are handled here, not in the player view. An
-                // AndroidView only gets DPAD/OK when it holds Android focus, and
-                // a player screen routinely does not — the app is re-creating the
-                // surface, or focus has moved to a Compose overlay, and in that
-                // state every key fell through to the Activity and did nothing.
-                // Consuming them only while the player is actually on screen
-                // keeps this from stealing the remote anywhere else.
-                if (PlayerKeyBus.onKey?.invoke(keyCode) == true) return true
             }
         }
         return super.onKeyDown(keyCode, event)
@@ -162,7 +235,39 @@ private fun AppNav() {
         onDispose { if (activity?.nav === nav) activity.nav = null }
     }
 
-    NavHost(navController = nav, startDestination = Routes.SPLASH) {
+    // A provider's `openWebView` call suspends until a human clears the page.
+    // It must surface wherever the call came from — catalog, detail, or the
+    // player — so the dialog lives above the NavHost instead of being a route:
+    // navigating away from the player would tear its ExoPlayer down.
+    val pendingWaf by WafCoordinator.pending.collectAsStateWithLifecycle()
+    val challenge = pendingWaf
+    if (challenge != null && nav.currentDestination?.route != Routes.WAF) {
+        Dialog(
+            onDismissRequest = { WafCoordinator.dismiss(challenge.id) },
+            properties = DialogProperties(usePlatformDefaultWidth = false),
+        ) {
+            Surface(Modifier.fillMaxSize(), color = Color.Black) {
+                WafScreen(
+                    url = challenge.url,
+                    onSolved = {},
+                    onClose = { WafCoordinator.dismiss(challenge.id) },
+                )
+            }
+        }
+    }
+
+    NavHost(
+        navController = nav,
+        startDestination = Routes.SPLASH,
+        // A full-screen alpha fade is the only transition that is essentially
+        // free on a TV GPU. It removes the hard cut between feed, detail and
+        // player without the layout cost of a slide (and without delaying the
+        // player: the incoming video starts under the fade).
+        enterTransition = { fadeIn(tween(140)) },
+        exitTransition = { fadeOut(tween(90)) },
+        popEnterTransition = { fadeIn(tween(140)) },
+        popExitTransition = { fadeOut(tween(90)) },
+    ) {
         composable(Routes.SPLASH) {
             SplashScreen(onDone = {
                 nav.navigate(Routes.HOME) { popUpTo(Routes.SPLASH) { inclusive = true } }
@@ -171,6 +276,7 @@ private fun AppNav() {
         composable(Routes.HOME) {
             HomeScreen(
                 onOpenPost = { post ->
+                    PlaybackSession.playbackRequested = true
                     PlaybackSession.pendingLink = post.link
                     PlaybackSession.pendingTitle = post.title
                     PlaybackSession.pendingPoster = post.image
@@ -180,7 +286,10 @@ private fun AppNav() {
                 onOpenWatchlist = { nav.navigate(Routes.WATCHLIST) },
                 onOpenExtensions = { nav.navigate(Routes.EXTENSIONS) },
                 onOpenSettings = { nav.navigate(Routes.SETTINGS) },
-                onPlayEntry = { nav.navigate(Routes.PLAYER) },
+                onPlayEntry = {
+                    PlaybackSession.playbackRequested = true
+                    nav.navigate(Routes.PLAYER)
+                },
                 onOpenCategory = { title, filter ->
                     nav.navigate(Routes.catalog(title, filter))
                 },
@@ -196,9 +305,13 @@ private fun AppNav() {
                 title = entry.arguments?.getString("title").orEmpty(),
                 filter = entry.arguments?.getString("filter").orEmpty(),
                 onOpenPost = { post ->
+                    PlaybackSession.playbackRequested = true
                     PlaybackSession.pendingLink = post.link
                     PlaybackSession.pendingTitle = post.title
                     PlaybackSession.pendingPoster = post.image
+                    // A catalog page is bound to the provider scope it was
+                    // opened in, which is active; no per-card handoff.
+                    PlaybackSession.pendingProvider = ""
                     nav.navigate(Routes.DETAIL)
                 },
                 onBack = { nav.popBackStack() },
@@ -207,9 +320,12 @@ private fun AppNav() {
         composable(Routes.SEARCH) {
             SearchScreen(
                 onOpenPost = { post ->
+                    PlaybackSession.playbackRequested = true
                     PlaybackSession.pendingLink = post.link
                     PlaybackSession.pendingTitle = post.title
                     PlaybackSession.pendingPoster = post.image
+                    // Search results follow the active provider scope.
+                    PlaybackSession.pendingProvider = ""
                     nav.navigate(Routes.DETAIL)
                 },
                 onSolveWaf = { url -> nav.navigate(Routes.waf(url)) },
@@ -217,7 +333,10 @@ private fun AppNav() {
         }
         composable(Routes.WATCHLIST) {
             WatchlistScreen(
-                onOpenItem = { nav.navigate(Routes.DETAIL) },
+                onOpenItem = {
+                    PlaybackSession.playbackRequested = true
+                    nav.navigate(Routes.DETAIL)
+                },
                 onBrowse = {
                     nav.navigate(Routes.HOME) { popUpTo(Routes.HOME) { inclusive = true } }
                 },
@@ -236,7 +355,10 @@ private fun AppNav() {
         }
         composable(Routes.DETAIL) {
             DetailScreen(
-                onPlay = { nav.navigate(Routes.PLAYER) },
+                onPlay = {
+                    PlaybackSession.playbackRequested = true
+                    nav.navigate(Routes.PLAYER)
+                },
                 onBack = { nav.popBackStack() },
                 onSolveWaf = { url -> nav.navigate(Routes.waf(url)) },
             )
@@ -259,4 +381,8 @@ private fun AppNav() {
             )
         }
     }
+
+    // Sits above the NavHost but only ever shows on a browse screen; see the
+    // composable for why it refuses to cover playback.
+    AutoUpdatePrompt()
 }

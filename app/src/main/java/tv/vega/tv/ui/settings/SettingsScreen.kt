@@ -1,10 +1,13 @@
 package tv.vega.tv.ui.settings
 
 import android.content.Intent
+import android.os.Build
+import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -15,6 +18,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -25,6 +29,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.documentfile.provider.DocumentFile
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.tv.material3.Button
 import androidx.tv.material3.MaterialTheme
@@ -34,9 +41,13 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import tv.vega.tv.data.ServiceLocator
+import tv.vega.tv.data.diag.DiagLog
 import tv.vega.tv.data.net.NetClients
 import tv.vega.tv.data.settings.SubtitleStyle
+import tv.vega.tv.data.update.ApkUpdater
+import tv.vega.tv.data.update.ReleaseInfo
 import tv.vega.tv.data.update.UpdateApi
+import java.io.File
 
 /**
  * Full parity with web Preference/Appearance/SubtitleSettings/About (TV
@@ -58,18 +69,25 @@ fun SettingsScreen(onBack: () -> Unit) {
         .collectAsStateWithLifecycle(initialValue = "off" to "")
     val tmdb by ServiceLocator.settings.tmdbApiKey
         .collectAsStateWithLifecycle(initialValue = "")
-    val autoCheck by ServiceLocator.settings.autoCheckUpdate
-        .collectAsStateWithLifecycle(initialValue = true)
     val preferBest by ServiceLocator.settings.preferBestQuality
         .collectAsStateWithLifecycle(initialValue = true)
     val maxFps by ServiceLocator.settings.maxFps
         .collectAsStateWithLifecycle(initialValue = "auto")
+    val audioLanguage by ServiceLocator.settings.audioLanguage
+        .collectAsStateWithLifecycle(initialValue = "hi")
+    val familyFilter by ServiceLocator.settings.familyFilter
+        .collectAsStateWithLifecycle(initialValue = true)
 
     var tmdbEdit by remember(tmdb) { mutableStateOf(tmdb) }
     var dohUrlEdit by remember(doh) { mutableStateOf(doh.second) }
     var status by remember { mutableStateOf<String?>(null) }
     var updateInfo by remember { mutableStateOf<String?>(null) }
-    var releasesUrl by remember { mutableStateOf<String?>(null) }
+    var pendingRelease by remember { mutableStateOf<ReleaseInfo?>(null) }
+    // Set when the OS blocks the install: we route to the per-app
+    // unknown-sources setting and finish the install once the user returns.
+    var pendingInstall by remember { mutableStateOf<File?>(null) }
+    var progress by remember { mutableStateOf<Pair<Long, Long>?>(null) }
+    var diagRev by remember { mutableStateOf(0) }
 
     val syncPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
         if (uri != null) {
@@ -90,8 +108,64 @@ fun SettingsScreen(onBack: () -> Unit) {
         runCatching { ctx.packageManager.getPackageInfo(ctx.packageName, 0).versionName }.getOrNull() ?: "1.0"
     }
 
+    fun requestInstall(f: File) {
+        if (Build.VERSION.SDK_INT >= 26 && !ctx.packageManager.canRequestPackageInstalls()) {
+            pendingInstall = f
+            updateInfo = "Allow installs for Vega TV — it continues automatically"
+            runCatching {
+                ctx.startActivity(
+                    Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES)
+                        .setData(android.net.Uri.parse("package:${ctx.packageName}"))
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                )
+            }.onFailure { updateInfo = "Couldn't open Settings: ${it.message}" }
+        } else {
+            runCatching { ApkUpdater.install(ctx, f) }
+                .onSuccess { updateInfo = "Installer opened — confirm to update" }
+                .onFailure { updateInfo = "Install failed: ${it.message}" }
+        }
+    }
+
+    fun downloadAndInstall(r: ReleaseInfo) {
+        val url = r.apkUrl ?: return
+        scope.launch {
+            progress = 0L to 0L
+            updateInfo = "Downloading…"
+            runCatching {
+                ApkUpdater.download(ctx, url, r.apkName) { read, total -> progress = read to total }
+            }.onSuccess { f ->
+                progress = null
+                updateInfo = "Downloaded ✓"
+                requestInstall(f)
+            }.onFailure {
+                progress = null
+                updateInfo = "Download failed: ${it.message}"
+            }
+        }
+    }
+
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val obs = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                val f = pendingInstall ?: return@LifecycleEventObserver
+                val allowed = Build.VERSION.SDK_INT < 26 ||
+                    ctx.packageManager.canRequestPackageInstalls()
+                if (allowed) {
+                    pendingInstall = null
+                    runCatching { ApkUpdater.install(ctx, f) }
+                        .onSuccess { updateInfo = "Installer opened — confirm to update" }
+                        .onFailure { updateInfo = "Install failed: ${it.message}" }
+                }
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(obs)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(obs) }
+    }
+
     LazyColumn(
-        Modifier.fillMaxSize().padding(32.dp),
+        Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(horizontal = 24.dp, vertical = 16.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
         item(key = "head") { Text("Settings", style = MaterialTheme.typography.headlineSmall) }
@@ -109,6 +183,22 @@ fun SettingsScreen(onBack: () -> Unit) {
                 "Start on the highest rendition the provider offers, not the first one listed",
                 preferBest,
             ) { scope.launch { ServiceLocator.settings.setPreferBestQuality(it) } }
+        }
+        item(key = "pb-audio") {
+            Text("Default audio", style = MaterialTheme.typography.titleMedium)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 6.dp)) {
+                listOf("hi" to "Hindi", "en" to "English").forEach { (v, l) ->
+                    Button(onClick = { scope.launch { ServiceLocator.settings.setAudioLanguage(v) } }) {
+                        Text((if (audioLanguage == v) "✓ " else "") + l)
+                    }
+                }
+            }
+            Text(
+                "Hindi plays when the provider offers it. If not, the source default plays; " +
+                    "MENU ▸ Audio changes it for the current stream.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
         item(key = "pb-fps") {
             Text("Frame rate cap", style = MaterialTheme.typography.titleMedium)
@@ -140,6 +230,17 @@ fun SettingsScreen(onBack: () -> Unit) {
                     }) { Text((if (on) "✓ " else "") + q) }
                 }
             }
+        }
+
+        item(key = "content-h") { Section("Content") }
+        item(key = "content-family") {
+            SwitchRow(
+                "Family filter",
+                "Hide 18+, adult, erotic, nudity and sex-related titles from every installed provider. " +
+                    "Duplicate cards are removed from Home. Provider listings do not expose spoken language, " +
+                    "so bad language cannot be detected before playback.",
+                familyFilter,
+            ) { scope.launch { ServiceLocator.settings.setFamilyFilter(it) } }
         }
 
         item(key = "sub-h") { Section("Subtitles") }
@@ -284,30 +385,74 @@ fun SettingsScreen(onBack: () -> Unit) {
         item(key = "about-h") { Section("About") }
         item(key = "about-v") {
             Text("Vega TV v$version", style = MaterialTheme.typography.titleMedium)
-            SwitchRow("Check for updates on start", "", autoCheck) {
-                scope.launch { ServiceLocator.settings.setAutoCheck(it) }
-            }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 8.dp)) {
                 Button(onClick = {
                     scope.launch {
                         updateInfo = "Checking…"
-                        releasesUrl = null
+                        pendingRelease = null
+                        progress = null
                         runCatching { UpdateApi.latest() }.onSuccess { r ->
                             if (UpdateApi.isNewer(r.tag, "v$version")) {
-                                updateInfo = "Update available: ${r.tag} ${r.name}"
-                                releasesUrl = r.htmlUrl
+                                pendingRelease = r
+                                updateInfo = buildString {
+                                    append("Update available: ${r.tag}")
+                                    if (r.name.isNotBlank()) append(" — ${r.name}")
+                                    val mb = ApkUpdater.sizeLabel(r.apkSize)
+                                    if (mb.isNotBlank()) append(" ($mb)")
+                                }
                             } else updateInfo = "Up to date ✓"
-                        }.onFailure { updateInfo = "Check failed" }
+                        }.onFailure { updateInfo = "Check failed: ${it.message}" }
                     }
                 }) { Text("Check now") }
-                releasesUrl?.let { u ->
-                    Button(onClick = {
-                        runCatching { ctx.startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(u))) }
-                    }) { Text("Open releases") }
+                pendingRelease?.let { r ->
+                    if (r.apkUrl != null) {
+                        Button(onClick = { downloadAndInstall(r) }, enabled = progress == null) {
+                            Text(if (progress != null) "Downloading…" else "Download & install")
+                        }
+                    } else {
+                        // A release without an attached APK: offer the page instead.
+                        Button(onClick = {
+                            runCatching {
+                                ctx.startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(r.htmlUrl)))
+                            }
+                        }) { Text("Open releases") }
+                    }
                 }
+            }
+            progress?.let { (read, total) ->
+                val pct = if (total > 0) (read * 100 / total).toInt() else -1
+                Text(
+                    if (pct >= 0) "Downloading… $pct%"
+                    else "Downloading… ${read / 1024 / 1024} MB",
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.padding(top = 6.dp),
+                )
             }
             updateInfo?.let {
                 Text(it, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 6.dp))
+            }
+            // A box that hard-reboots on a decoder fault leaves no reachable
+            // stack trace; these two files are written before the fault and
+            // are the only forensic evidence available after it.
+            Column(Modifier.padding(top = 14.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text("Diagnostics", style = MaterialTheme.typography.titleSmall)
+                val lastPlayback = remember(diagRev) { DiagLog.read(ctx, DiagLog.LAST_PLAYBACK) }
+                val lastCrash = remember(diagRev) { DiagLog.read(ctx, DiagLog.LAST_CRASH) }
+                Text(
+                    "Last playback:\n${lastPlayback ?: "—"}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    "Last crash:\n${lastCrash ?: "none"}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Button(onClick = {
+                    DiagLog.clear(ctx, DiagLog.LAST_CRASH)
+                    DiagLog.clear(ctx, DiagLog.LAST_PLAYBACK)
+                    diagRev++
+                }) { Text("Clear diagnostics") }
             }
         }
 

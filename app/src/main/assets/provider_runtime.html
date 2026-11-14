@@ -43,6 +43,7 @@ function __nativeFetch(url, init){
   var headers=init.headers||{};
   var body=init.body;
   var payload={url:String(url), method:String(init.method||'GET'), headers:{}};
+  if(init.timeoutMs>0) payload.timeoutMs=init.timeoutMs;
   for(var k in headers){ if(Object.prototype.hasOwnProperty.call(headers,k)) payload.headers[k]=String(headers[k]); }
   if(body!==undefined&&body!==null){
     try{ payload.bodyBase64=btoa(String(body)); }catch(e){}
@@ -69,14 +70,30 @@ function __hasNativeFetch(){
   catch(e){ return false; }
 }
 window.__vegaFetch = function(url, init){
+  var raw=String(url==null?'':url);
   var u;
   try{
-    u=new URL(String(url), window.location.href);
+    // This page's origin is https://localhost/, which the host guard treats as
+    // a private address. Providers sometimes fetch a site-relative path
+    // ("/download/…") or build one from window.location; resolving those
+    // against the page origin produced "Blocked private host" on Continue
+    // Watching while the same title played from its feed. Resolve anything
+    // relative against the provider's real base URL from urls.json.
+    u=new URL(raw, 'https://vega.invalid/');
+    var hasScheme=/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(raw);
+    var localOrigin=u.hostname==='localhost'||u.hostname==='127.0.0.1'||u.hostname==='::1';
+    if(!hasScheme||localOrigin){
+      return window.__getBaseUrl(__pv).then(function(base){
+        base=String(base||'');
+        if(!base) throw new Error('Provider base URL unavailable for '+raw);
+        return window.__vegaFetch(new URL(raw, base).toString(), init);
+      });
+    }
     if(u.protocol!=='http:'&&u.protocol!=='https:') return Promise.reject(new Error('Blocked protocol'));
     if(__isBlockedHost(u.hostname)) return Promise.reject(new Error('Blocked private host'));
   }catch(e){ return Promise.reject(e); }
   if(__hasNativeFetch()) return __nativeFetch(u.toString(), init);
-  return __realFetch(url, init).then(function(resp){
+  return __realFetch(u.toString(), init).then(function(resp){
     if(resp.status===403||resp.status===503){
       return resp.clone().text().then(function(t){
         if(/challenge-platform|just a moment|cf-chl|captcha/i.test(t||'')) __wafThrow(url);
@@ -306,6 +323,9 @@ async function __axiosReq(method, url, opts){
   var reqInit={method:method,headers:headers};
   if(b!==undefined) reqInit.body=b;
   if(opts.signal) reqInit.signal=opts.signal;
+  // The native bridge is a blocking call; honour axios `timeout` here so one
+  // unresponsive mirror cannot consume the whole getStream budget.
+  if(opts.timeout>0) reqInit.timeoutMs=opts.timeout;
   var resp=await window.__vegaFetch(finalUrl,reqInit);
   var text=await resp.text();
   if((resp.status===403||resp.status===503)&&/challenge-platform|just a moment|cf-chl|captcha/i.test(text||'')){
@@ -510,18 +530,37 @@ window.__vegaConsole=function(level,args){
 /* Android's evaluateJavascript does NOT await a returned Promise: it serialises
    the return value straight away, so a Promise arrives as `{}` — which decoded
    to a null payload and surfaced as "non-array: null" no matter what the provider
-   returned. Push the result into the native bridge instead and return at once. */
-window.__vegaDone=function(payload){
-  try{ if(window.VegaHttp&&window.VegaHttp.result) window.VegaHttp.result(String(payload)); }
+   returned. Push the result into the native bridge instead and return at once.
+
+   Every payload carries the invoke id: cancelling the Kotlin invoke cannot stop
+   the JS promise it already started, so an orphan can resolve after the next
+   invoke is already waiting. The id lets the bridge drop that stale payload
+   instead of completing the wrong request (the old search-lag bug). */
+window.__vegaDone=function(id, payload){
+  try{ if(window.VegaHttp&&window.VegaHttp.result) window.VegaHttp.result(String(id), String(payload)); }
   catch(e){}
+};
+/* Abort the JS side of an invoke. Passing null/'' aborts whatever is active.
+   In-flight provider fetches observe the AbortController signal, so a
+   superseded search stops costing network instead of running to completion. */
+window.__vegaAbort=function(id){
+  var active=window.__vegaActiveInvoke;
+  if(active && (!id || active.id===String(id))){
+    window.__vegaActiveInvoke=null;
+    try{ if(active.controller) active.controller.abort(); }catch(e){}
+  }
 };
 window.__vegaInvoke=function(exportName, args){
   args=args||{};
+  var invokeId=String(args.invokeId||'');
+  // A new invoke means the previous one is no longer wanted. Abort it before
+  // touching the shared module/exports so its fetch chain winds down.
+  window.__vegaAbort(null);
   __pv=String(args.providerValue||'');
   var modExports=(window.__vegaModule&&window.__vegaModule.exports)||{};
   var fn=modExports[exportName];
   if(typeof fn!=='function'){
-    window.__vegaDone(JSON.stringify({__error:'missing export '+exportName}));
+    window.__vegaDone(invokeId, JSON.stringify({__error:'missing export '+exportName}));
     return 'started';
   }
   /* openWebView is how a provider asks the *user* to clear a Cloudflare
@@ -536,39 +575,104 @@ window.__vegaInvoke=function(exportName, args){
     getCookies:function(url){ return __rpc('getCookies',{url:String(url||'')}); },
     openWebView:function(url, options){
       options=options||{};
-      return __rpc('openWebView',{
+      // A human is solving the gate: the provider budget must not keep
+      // counting down while the dialog is on screen.
+      if(window.__vegaWafPause) window.__vegaWafPause();
+      var p=__rpc('openWebView',{
         url:String(url||''),
         waitForCookie: options.waitForCookie||'',
-        waitForLoad: !!options.waitForLoad
+        waitForLoad: !!options.waitForLoad,
+        force: !!options.force,
+        headers: options.headers||{},
+        injectedJavaScript: options.injectedJavaScript||'',
+        timeoutMs: options.timeoutMs||0,
+        title: options.title||'',
+        description: options.description||''
       },0);
+      return p.then(
+        function(v){ if(window.__vegaWafResume) window.__vegaWafResume(); return v; },
+        function(e){ if(window.__vegaWafResume) window.__vegaWafResume(); throw e; }
+      );
     },
     kvStore:window.__kvStore
   };
   var controller=new AbortController();
+  window.__vegaActiveInvoke={id:invokeId, controller:controller};
   var budget=(args.timeoutMs)||120000;
-  var timer=setTimeout(function(){
+  var remaining=budget;
+  var timer=null;
+  var finished=false;
+  /* One completion path: the first result wins, and a superseded invoke can
+     never post a second payload or clobber the next invoke's WAF hooks. */
+  var done=function(payload){
+    if(finished) return;
+    finished=true;
+    if(timer!==null){ clearTimeout(timer); timer=null; }
+    if(window.__vegaActiveInvoke && window.__vegaActiveInvoke.id===invokeId){
+      window.__vegaActiveInvoke=null;
+    }
+    window.__vegaDone(invokeId, payload);
+  };
+  var clearWaf=function(){
+    if(!window.__vegaActiveInvoke || window.__vegaActiveInvoke.id===invokeId){
+      window.__vegaWafPause=null;
+      window.__vegaWafResume=null;
+    }
+  };
+  var started=Date.now();
+  var wafDepth=0;
+  var onTimeout=function(){
+    timer=null;
     try{ controller.abort(); }catch(e){}
-    window.__vegaDone(JSON.stringify({__error:'Provider '+exportName+' timed out after '+
+    done(JSON.stringify({__error:'Provider '+exportName+' timed out after '+
       budget+'ms (the provider fetch never returned)'}));
-  },budget);
+  };
+  // Aborting this invoke (a newer call started) also stops its timeout timer.
+  try{
+    controller.signal.addEventListener('abort',function(){
+      if(timer!==null){ clearTimeout(timer); timer=null; }
+    });
+  }catch(e){}
+  var arm=function(ms){
+    started=Date.now();
+    timer=setTimeout(onTimeout,Math.max(1000,ms));
+  };
+  var pauseBudget=function(){
+    wafDepth++;
+    if(wafDepth===1 && timer!==null){
+      clearTimeout(timer);
+      timer=null;
+      remaining-=Date.now()-started;
+      if(remaining<1000) remaining=1000;
+    }
+  };
+  var resumeBudget=function(){
+    if(wafDepth>0) wafDepth--;
+    if(wafDepth===0 && timer===null && !controller.signal.aborted){
+      arm(remaining);
+    }
+  };
+  window.__vegaWafPause=pauseBudget;
+  window.__vegaWafResume=resumeBudget;
+  arm(budget);
   var callArgs=Object.assign({},(args.params)||{},{signal:controller.signal,providerContext:ctx});
   window.__vegaConsole('info','invoke '+exportName+' params='+JSON.stringify((args.params)||{}));
   Promise.resolve().then(function(){ return fn(callArgs); }).then(
     function(r){
-      clearTimeout(timer);
+      clearWaf();
       var t=(r===undefined)?'undefined':(r===null?'null':Array.isArray(r)?'array('+r.length+')':typeof r);
       window.__vegaConsole('info','invoke '+exportName+' -> '+t);
       /* providerGlobal survives across invokes on mobile (fresh worker per call,
          state handed in and returned). Push it natively before the result so
          the host has it when the invoke settles — the bridge calls are ordered,
          and a provider mutation must not be lost just because the app moved on. */
-      try{ if(window.VegaHttp&&window.VegaHttp.state) window.VegaHttp.state(JSON.stringify(window.providerGlobal||{})); }catch(e){}
-      window.__vegaDone(JSON.stringify({__ok:(r===undefined?null:r)}));
+      try{ if(window.VegaHttp&&window.VegaHttp.state) window.VegaHttp.state(invokeId, JSON.stringify(window.providerGlobal||{})); }catch(e){}
+      done(JSON.stringify({__ok:(r===undefined?null:r)}));
     },
     function(e){
-      clearTimeout(timer);
+      clearWaf();
       window.__vegaConsole('error','invoke '+exportName+' threw: '+String((e&&e.message||e)));
-      window.__vegaDone(JSON.stringify({__error:String((e&&e.message||e))}));
+      done(JSON.stringify({__error:String((e&&e.message||e))}));
     }
   );
   return 'started';

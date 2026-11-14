@@ -16,9 +16,14 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -60,12 +65,22 @@ fun EpisodeCard(
     modifier: Modifier = Modifier,
     watched: Boolean = false,
     progress: Float? = null,
+    // A movie's "episodes" are its quality renditions. Their titles are the
+    // entire point ("4K HDR REMUX HEVC H265 IMAX 80.2GB"), and the file-name
+    // heuristics would collapse them to "Episode 1" — complete with a
+    // meaningless EP chip.
+    qualityCard: Boolean = false,
 ) {
-    val label = episodeLabel(episode)
+    val label = if (qualityCard) {
+        episode.title.trim().ifBlank { episodeLabel(episode) }
+    } else {
+        episodeLabel(episode)
+    }
+    var focused by remember { mutableStateOf(false) }
     Column(modifier.width(EPISODE_CARD_WIDTH_DP.dp)) {
         Card(
             onClick = onClick,
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier.fillMaxWidth().onFocusChanged { focused = it.isFocused },
             shape = CardDefaults.shape(shape = RoundedCornerShape(10.dp)),
             border = CardDefaults.border(
                 border = Border(
@@ -109,7 +124,7 @@ fun EpisodeCard(
                             tint = MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.size(26.dp),
                         )
-                        val num = episodeNumber(episode)
+                        val num = if (qualityCard) "" else episodeNumber(episode)
                         if (num.isNotBlank()) {
                             Text(
                                 "EP $num",
@@ -137,7 +152,7 @@ fun EpisodeCard(
                     }
                 }
                 // Episode number chip when there is an image to put it on.
-                val num = episodeNumber(episode)
+                val num = if (qualityCard) "" else episodeNumber(episode)
                 if (img.isNotBlank() && !watched && num.isNotBlank()) {
                     Text(
                         "EP $num",
@@ -164,13 +179,12 @@ fun EpisodeCard(
                 }
             }
         }
-        Text(
-            label,
+        MarqueeText(
+            text = label,
+            active = focused,
             style = MaterialTheme.typography.labelMedium,
             fontWeight = FontWeight.Medium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
-            maxLines = 2,
-            overflow = TextOverflow.Ellipsis,
             modifier = Modifier.fillMaxWidth().padding(top = 5.dp, bottom = 2.dp),
         )
     }
@@ -194,11 +208,14 @@ fun ResumeCard(
     modifier: Modifier = Modifier,
     subtitle: String? = null,
     progress: Float = 0f,
+    onLongClick: (() -> Unit)? = null,
 ) {
+    var focused by remember { mutableStateOf(false) }
     Column(modifier.width(220.dp)) {
         Card(
             onClick = onClick,
-            modifier = Modifier.fillMaxWidth(),
+            onLongClick = onLongClick,
+            modifier = Modifier.fillMaxWidth().onFocusChanged { focused = it.isFocused },
             shape = CardDefaults.shape(shape = RoundedCornerShape(10.dp)),
             border = CardDefaults.border(
                 border = Border(
@@ -248,13 +265,12 @@ fun ResumeCard(
                 }
             }
         }
-        Text(
-            title,
+        MarqueeText(
+            text = title,
+            active = focused,
             style = MaterialTheme.typography.labelLarge,
             fontWeight = FontWeight.Medium,
             color = MaterialTheme.colorScheme.onSurface,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
             modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
         )
         if (!subtitle.isNullOrBlank()) {
@@ -271,7 +287,10 @@ fun ResumeCard(
 }
 
 private val SE_EPISODE = Regex("""(?i)\bS\d{1,3}\s*[.\-_ ]?\s*E(?:P)?\s*(\d{1,3})\b""")
+private val WORD_EPISODE = Regex("""(?i)\b(?:episode|ep)\s*[._\- ]?\s*(\d{1,4})\b""")
+private val TAG_E = Regex("""(?i)\bE\s*[._\-]?\s*(\d{1,4})\b""")
 private val LEADING_NUMBERED = Regex("""^\s*\d{1,3}\s*[._\-]\s*\S""")
+private val LEADING_NUM = Regex("""^\s*(\d{1,3})\s*[._\-]\s*\S""")
 private val FILE_EXT =
     Regex("""(?i)\.(mkv|mp4|avi|m4v|ts|m3u8|webm|mov|flv|wmv)$""")
 private val FILE_JUNK =
@@ -286,8 +305,28 @@ private fun looksLikeFileName(title: String): Boolean =
         FILE_JUNK.containsMatchIn(title) ||
         LEADING_NUMBERED.containsMatchIn(title)
 
+/**
+ * The episode's own number as its title states it, or null when the title
+ * does not carry one.
+ *
+ * [EpisodeItem.number] is the provider's list position, and list order is not
+ * trustworthy: hosts that list newest-first made the position count 1,2,3…
+ * while the titles counted 12,11,10…, so the chip inside a card ran in
+ * reverse compared to the label under it. S01E12 / "Episode 12" / "E12" /
+ * "12 - Title" all state the truth; the position is only the last resort.
+ */
+private fun numberFromTitle(raw: String): Int? {
+    raw.trim().toIntOrNull()?.let { if (it in 1..9999) return it }
+    SE_EPISODE.find(raw)?.let { return it.groupValues[1].toInt() }
+    WORD_EPISODE.find(raw)?.let { return it.groupValues[1].toInt() }
+    if (!looksLikeFileName(raw)) return null
+    TAG_E.find(raw)?.let { return it.groupValues[1].toInt() }
+    LEADING_NUM.find(raw)?.let { return it.groupValues[1].toInt() }
+    return null
+}
+
 internal fun episodeNumber(episode: EpisodeItem): String =
-    if (episode.number > 0) episode.number.toString() else ""
+    (numberFromTitle(episode.title) ?: episode.number.takeIf { it > 0 })?.toString().orEmpty()
 
 /**
  * A title a person can read, out of whatever the provider called this episode.
@@ -300,7 +339,7 @@ internal fun episodeLabel(episode: EpisodeItem): String {
     val raw = episode.title.trim()
     if (raw.isBlank()) return "Episode ${episodeNumber(episode)}".trim()
     if (!looksLikeFileName(raw)) return raw
-    SE_EPISODE.find(raw)?.let { return "Episode ${it.groupValues[1].toInt()}" }
+    numberFromTitle(raw)?.let { return "Episode $it" }
     val n = episodeNumber(episode)
     return if (n.isBlank()) "Episode" else "Episode $n"
 }

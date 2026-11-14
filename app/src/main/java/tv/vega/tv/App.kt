@@ -9,12 +9,15 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import tv.vega.tv.data.ServiceLocator
+import tv.vega.tv.data.diag.DiagLog
 import tv.vega.tv.data.net.NetClients
 
 class App : Application(), ImageLoaderFactory {
     override fun onCreate() {
         super.onCreate()
         ServiceLocator.init(this)
+        // Record uncaught Java failures before the process dies.
+        DiagLog.install(this)
         // Apply stored DoH/network prefs to the shared HTTP stack.
         CoroutineScope(Dispatchers.IO).launch {
             runCatching { NetClients.refresh(this@App) }

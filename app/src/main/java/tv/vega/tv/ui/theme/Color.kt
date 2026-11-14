@@ -6,8 +6,12 @@ import androidx.compose.ui.graphics.Color
 // primary tomato, legacy tertiary #171717, onSurface #F5F0EF.
 val VegaPrimary = Color(0xFFFF6347)
 val VegaOnPrimary = Color(0xFF17100F)
-val VegaBackground = Color(0xFF0B0605) // primary mixed 94% toward black
-val VegaSurface = Color(0xFF0B0605)
+// AMOLED black: OLED pixels are truly off at #000000, so the page disappears
+// into the panel edge (and every dark scene does too). Elevated containers
+// below are deliberately *not* black, or cards would vanish on a TV in a
+// bright room.
+val VegaBackground = Color(0xFF000000)
+val VegaSurface = Color(0xFF000000)
 val VegaSurfaceLow = Color(0xFF120B09)
 val VegaSurfaceContainer = Color(0xFF1A100D)
 val VegaSurfaceHigh = Color(0xFF211612)

@@ -3,6 +3,7 @@ package tv.vega.tv.data.providers
 import android.content.Context
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
@@ -13,13 +14,36 @@ import tv.vega.tv.data.model.SeasonEntry
 import tv.vega.tv.data.model.VegaInfo
 import tv.vega.tv.data.model.VegaPost
 import tv.vega.tv.data.model.VegaStream
+import tv.vega.tv.player.PlaybackSession
 
 private const val TAG = "VegaProviderManager"
 
 /**
+ * Upstream aborts a stream fetch after 45s (`fetchStreamList`). The old 25s
+ * budget killed providers that probe several servers, and it killed the call
+ * before a provider could hand a Cloudflare challenge to the user.
+ */
+private const val GET_STREAM_TIMEOUT_MS = 45_000L
+
+/** Upstream `updateCheckIntervalMs`: providers are refreshed at most 4x/day. */
+private const val UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1000L
+
+/** Failed passes retry sooner than a full six-hour cycle. */
+private const val UPDATE_RETRY_MS = 15 * 60 * 1000L
+
+/**
+ * The UA providers get as `providerContext.commonHeaders['User-Agent']`.
+ * The challenge WebView must present the same one: Cloudflare binds its
+ * clearance cookie to the User-Agent, so solving the page with the stock
+ * WebView UA would earn a cookie the provider's HTTP stack cannot use.
+ */
+internal const val COMMON_USER_AGENT =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0"
+
+/**
  * Kotlin port of web ProviderManager + ExtensionManager flows:
  * seed source → manifest → install modules → sandboxed invokes.
- * Same semantics: 25s stream timeout, array guards, disabled filtering.
+ * Same semantics: 45s stream timeout, array guards, disabled filtering.
  */
 class ProviderManager(appContext: Context) {
     private val ctx = appContext.applicationContext
@@ -38,6 +62,96 @@ class ProviderManager(appContext: Context) {
 
     data class Active(val ext: ProviderExtension, val source: ProviderSource)
 
+    /**
+     * Result of one automatic update pass. [checked] is the number of sources
+     * whose manifest was fetched, not the number of providers.
+     */
+    data class UpdateReport(
+        val checkedSources: Int,
+        val updated: Int,
+        val failed: Int,
+        val skipped: Boolean = false,
+    )
+
+    private val updateMutex = Mutex()
+
+    /**
+     * Check every installed provider against its source manifest and download
+     * newer modules, mirroring the mobile app's six-hour update pass.
+     *
+     * Throttled: a normal Home load within six hours returns immediately, so
+     * startup stays fast. A failed pass only records a short retry window, so
+     * one unreachable source cannot postpone every provider for six hours.
+     */
+    suspend fun checkForUpdates(force: Boolean = false): UpdateReport = withContext(Dispatchers.IO) {
+        updateMutex.withLock {
+            ensureSeeded()
+            val now = System.currentTimeMillis()
+            val last = runCatching { store.lastUpdateCheck() }.getOrDefault(0L)
+            val retryAt = runCatching { store.updateRetryAt() }.getOrDefault(0L)
+            if (!force && (now < retryAt || now - last < UPDATE_INTERVAL_MS)) {
+                return@withLock UpdateReport(checkedSources = 0, updated = 0, failed = 0, skipped = true)
+            }
+            val sources = store.sources()
+            val installed = store.installed()
+            var checked = 0
+            var updated = 0
+            var failed = 0
+            var aborted = false
+            for (source in sources) {
+                // Cancellation is cooperative and a blocking manifest fetch
+                // cannot be interrupted; check the real playback state as the
+                // last line of defence before spending another request/disk
+                // write while a film is starting.
+                if (PlaybackSession.playerActive || PlaybackSession.playbackRequested) {
+                    aborted = true
+                    break
+                }
+                val available = runCatching {
+                    api.refreshManifest(source, force = true)
+                }.onFailure {
+                    failed++
+                    Log.w(TAG, "Update manifest failed for ${source.author}: ${it.message}")
+                }.getOrNull() ?: continue
+                checked++
+                val latestByValue = available.associateBy { it.value }
+                for (ext in installed.filter { it.source.author == source.author }) {
+                    if (PlaybackSession.playerActive || PlaybackSession.playbackRequested) {
+                        aborted = true
+                        break
+                    }
+                    val latest = latestByValue[ext.value] ?: continue
+                    if (latest.disabled) continue
+                    if (!isNewerProviderVersion(latest.version, ext.version)) continue
+                    runCatching {
+                        // downloadModules also writes the installed provider
+                        // metadata (including a renamed icon/path).
+                        api.downloadModules(source, latest)
+                    }.onSuccess {
+                        updated++
+                        Log.i(TAG, "Updated ${ext.value} ${ext.version} -> ${latest.version}")
+                    }.onFailure {
+                        failed++
+                        Log.w(TAG, "Update failed for ${ext.value}: ${it.message}")
+                    }
+                }
+                if (aborted) break
+            }
+            val finishedAt = System.currentTimeMillis()
+            if (aborted) {
+                // Playback interrupted this pass. Do not record it as a full
+                // six-hour check; try again when the viewer has left the film.
+                runCatching { store.setUpdateRetryAt(finishedAt + UPDATE_RETRY_MS) }
+            } else if (failed == 0) {
+                runCatching { store.setLastUpdateCheck(finishedAt) }
+                runCatching { store.setUpdateRetryAt(0L) }
+            } else {
+                runCatching { store.setUpdateRetryAt(finishedAt + UPDATE_RETRY_MS) }
+            }
+            UpdateReport(checkedSources = checked, updated = updated, failed = failed)
+        }
+    }
+
     suspend fun active(): Active? = withContext(Dispatchers.IO) {
         val ref = store.activeRef() ?: return@withContext null
         val installed = store.installed()
@@ -51,6 +165,27 @@ class ProviderManager(appContext: Context) {
     suspend fun setActive(ext: ProviderExtension) {
         store.setActiveRef("${ext.source.author}:${ext.value}")
     }
+
+    /**
+     * Point the active provider at [ref], which is either "author:value" or the
+     * bare provider value (history/watchlist entries store the value alone).
+     *
+     * A post opened from a mixed Home page carries the provider it came from;
+     * resolving its link against whatever provider happened to be active
+     * returned a *different* title's detail page. No-op when [ref] is blank or
+     * its provider is not installed.
+     */
+    suspend fun activate(ref: String) = withContext(Dispatchers.IO) {
+        if (ref.isBlank()) return@withContext
+        val installed = store.installed()
+        val ext = installed.firstOrNull { "${it.source.author}:${it.value}" == ref }
+            ?: installed.firstOrNull { it.value == ref }
+            ?: return@withContext
+        store.setActiveRef("${ext.source.author}:${ext.value}")
+    }
+
+    /** Every installed provider (the sidebar lists them for switching). */
+    suspend fun installed(): List<ProviderExtension> = withContext(Dispatchers.IO) { store.installed() }
 
     /**
      * Mobile (ExtensionManager.initialize) seeds the official `Zenda-Cross`
@@ -124,7 +259,7 @@ class ProviderManager(appContext: Context) {
 
     private fun commonHeaders(): String = JSONObject(
         mapOf(
-            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
+            "User-Agent" to COMMON_USER_AGENT,
             "Accept-Language" to "en-US,en;q=0.9",
         ),
     ).toString()
@@ -144,8 +279,34 @@ class ProviderManager(appContext: Context) {
 
     suspend fun getCatalog(a: Active): Pair<List<CatalogEntry>, List<CatalogEntry>> {
         val code = moduleCode(a, "catalog")
-        // Static eval path (no network): use lightweight evalCatalog.
-        return js.evalCatalog(code)
+        // Old bundles export a static array, which the lightweight eval path
+        // reads without touching the network. Newer bundles (Kartoons 2.x)
+        // export an async `catalog` function that establishes an account
+        // session first; that has to run through the full invoke runtime where
+        // providerContext.openWebView exists.
+        val static = js.evalCatalog(code)
+        val catalog = if (static.catalogIsFunction) {
+            invokeCatalogList(a, code, "catalog")
+        } else {
+            static.catalog
+        }
+        val genres = if (static.genresIsFunction) {
+            runCatching { invokeCatalogList(a, code, "genres") }.getOrDefault(emptyList())
+        } else {
+            static.genres
+        }
+        return catalog to genres
+    }
+
+    private suspend fun invokeCatalogList(
+        a: Active,
+        code: String,
+        exportName: String,
+    ): List<CatalogEntry> {
+        val raw = guarded {
+            js.invoke(a.ext.value, code, exportName, "{}", commonHeaders())
+        }
+        return decodeOrThrow(requireArray(raw, a.ext.value, exportName), a.ext.value, exportName)
     }
 
     suspend fun getPosts(a: Active, filter: String, page: Int): List<VegaPost> {
@@ -206,10 +367,23 @@ class ProviderManager(appContext: Context) {
             .put("type", type)
             .put("isDownload", isDownload)
             .toString()
-        val raw = guarded { js.invoke(a.ext.value, code, "getStream", params, commonHeaders(), timeoutMs = 25_000) }
+        val raw = guarded {
+            js.invoke(a.ext.value, code, "getStream", params, commonHeaders(), timeoutMs = GET_STREAM_TIMEOUT_MS)
+        }
         val arr = requireArray(raw, a.ext.value, "getStream")
-        return decodeOrThrow<List<VegaStream>>(arr, a.ext.value, "getStream").map { withJarCookie(it) }
+        return decodeOrThrow<List<VegaStream>>(arr, a.ext.value, "getStream")
+            .filterNot { it.isDownloadOnlyDrive() }
+            .map { withJarCookie(it) }
     }
+
+    /**
+     * HubCloud-based providers expose the Google Drive mirror as "GDrive
+     * (download only)" / "G-Drive (download only)". Those links open a browser
+     * download page rather than a playable stream, so on TV they only ever
+     * became dead entries in the server list.
+     */
+    private fun VegaStream.isDownloadOnlyDrive(): Boolean =
+        server.contains("download only", ignoreCase = true)
 
     /**
      * Mirrors mobile `withJarCookies`: streams get the site's cookies (a WAF

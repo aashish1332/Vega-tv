@@ -2,11 +2,13 @@ package tv.vega.tv.ui.catalog
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import tv.vega.tv.data.ServiceLocator
+import tv.vega.tv.data.repo.FamilyFilter
 
 /**
  * One catalog row, paginated.
@@ -34,6 +36,7 @@ class CatalogViewModel : ViewModel() {
     private var job: Job? = null
     private var page = 0
     private var exhausted = false
+    private val seenTitles = HashSet<String>()
 
     fun start(filter: String) {
         // A screen can re-enter (rotation, back-and-forth) with the same filter;
@@ -46,11 +49,24 @@ class CatalogViewModel : ViewModel() {
         job?.cancel()
         page = 0
         exhausted = false
+        seenTitles.clear()
         _posts.value = emptyList()
         _loading.value = true
         _loadingMore.value = false
         _error.value = null
         loadMore()
+    }
+
+    /**
+     * Stop a page fetch when the viewer opens a title. The grid stays in the
+     * back stack while a film plays, and a catalog request must not share the
+     * network with the video.
+     */
+    fun cancelPending() {
+        job?.cancel()
+        job = null
+        _loading.value = false
+        _loadingMore.value = false
     }
 
     fun loadMore() {
@@ -59,19 +75,28 @@ class CatalogViewModel : ViewModel() {
         _loadingMore.value = true
         job?.cancel()
         job = viewModelScope.launch {
-            runCatching { ServiceLocator.repository.posts(f, page + 1) }
-                .onSuccess { newPage ->
-                    if (newPage.isEmpty()) {
-                        exhausted = true
-                    } else {
-                        page += 1
-                        _posts.value = _posts.value + newPage
-                    }
-                    _error.value = null
+            try {
+                val newPage = ServiceLocator.repository.postsPage(f, page + 1)
+                if (newPage.rawCount == 0) {
+                    exhausted = true
+                } else {
+                    page += 1
+                    // Paginated provider feeds repeat a title on more than one
+                    // page. Repository filtering is per page, so remember what
+                    // this grid has already shown. A page emptied by the family
+                    // filter is not the end of the provider's feed.
+                    val fresh = newPage.posts.filter { seenTitles.add(FamilyFilter.dedupeKey(it.title)) }
+                    if (fresh.isNotEmpty()) _posts.value = _posts.value + fresh
                 }
-                .onFailure { e -> _error.value = e.message ?: "Failed to load" }
-            _loading.value = false
-            _loadingMore.value = false
+                _error.value = null
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                _error.value = e.message ?: "Failed to load"
+            } finally {
+                _loading.value = false
+                _loadingMore.value = false
+            }
         }
     }
 }

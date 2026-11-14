@@ -26,6 +26,10 @@ data class WatchEntry(
     val link: String = "",
     val provider: String = "",
     val episodeIndex: Int = 0,
+    // "movie"/"tv"/"anime" from the provider. Continue Watching can start the
+    // saved link immediately with the right stream contract, without a meta
+    // round trip before the player appears.
+    val mediaType: String = "",
 )
 
 /**
@@ -35,6 +39,25 @@ class WatchHistoryStore(private val context: Context) {
     private val json = Json { ignoreUnknownKeys = true }
     private val itemsKey = stringPreferencesKey("items_json")
 
+    /**
+     * A player exit or a stale sync can finish its history write just after
+     * the viewer removed the card. Remember both identities briefly so that
+     * late upsert cannot resurrect the row they just deleted.
+     */
+    private val deletedKeys = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    private fun isRecentlyDeleted(entry: WatchEntry): Boolean {
+        val now = System.currentTimeMillis()
+        return listOf(entry.mediaId, entry.link).any { key ->
+            if (key.isBlank()) return@any false
+            val at = deletedKeys[key] ?: return@any false
+            if (now - at <= DELETE_WINDOW_MS) true else {
+                deletedKeys.remove(key, at)
+                false
+            }
+        }
+    }
+
     val items: Flow<List<WatchEntry>> =
         context.historyStore.data.map { prefs ->
             prefs[itemsKey]?.let { runCatching { json.decodeFromString<List<WatchEntry>>(it) }.getOrNull() }
@@ -42,7 +65,11 @@ class WatchHistoryStore(private val context: Context) {
         }
 
     suspend fun upsert(entry: WatchEntry) {
+        if (isRecentlyDeleted(entry)) return
         context.historyStore.edit { prefs ->
+            // Re-check inside the serialized transform: a delete can land
+            // between the check above and this edit being applied.
+            if (isRecentlyDeleted(entry)) return@edit
             val cur = prefs[itemsKey]?.let {
                 runCatching { json.decodeFromString<MutableList<WatchEntry>>(it) }.getOrNull()
             } ?: mutableListOf()
@@ -57,17 +84,22 @@ class WatchHistoryStore(private val context: Context) {
         }
     }
 
-    suspend fun remove(mediaId: String) {
+    suspend fun remove(mediaId: String, link: String = "") {
+        val now = System.currentTimeMillis()
+        if (mediaId.isNotBlank()) deletedKeys[mediaId] = now
+        if (link.isNotBlank()) deletedKeys[link] = now
         context.historyStore.edit { prefs ->
             val cur = prefs[itemsKey]?.let {
                 runCatching { json.decodeFromString<MutableList<WatchEntry>>(it) }.getOrNull()
             } ?: mutableListOf()
-            cur.removeAll { it.mediaId == mediaId }
+            cur.removeAll { it.mediaId == mediaId || (link.isNotBlank() && it.link == link) }
             prefs[itemsKey] = json.encodeToString(cur)
         }
     }
 
     companion object {
+        private const val DELETE_WINDOW_MS = 8_000L
+
         fun progressFraction(e: WatchEntry): Float =
             if (e.durationMs > 0) (e.positionMs.toFloat() / e.durationMs).coerceIn(0f, 1f) else 0f
 

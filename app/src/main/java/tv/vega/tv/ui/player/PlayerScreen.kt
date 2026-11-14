@@ -3,7 +3,6 @@ package tv.vega.tv.ui.player
 import android.content.Intent
 import android.net.Uri
 import android.view.ViewGroup
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -18,9 +17,11 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.wrapContentHeight
 import androidx.compose.foundation.layout.wrapContentWidth
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -30,12 +31,14 @@ import androidx.compose.material.icons.filled.AspectRatio
 import androidx.compose.material.icons.filled.Audiotrack
 import androidx.compose.material.icons.filled.Forward10
 import androidx.compose.material.icons.filled.HighQuality
-import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Replay10
 import androidx.compose.material.icons.filled.SkipNext
+import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material.icons.filled.Speed
+import androidx.compose.material.icons.filled.Storage
 import androidx.compose.material.icons.filled.Subtitles
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.runtime.Composable
@@ -55,12 +58,8 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusEvent
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.StrokeCap
-import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.font.FontWeight
@@ -72,17 +71,21 @@ import androidx.core.net.toUri
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.media3.common.C
+import androidx.media3.common.Format
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
 import androidx.media3.common.TrackSelectionOverride
 import androidx.media3.datasource.DataSource
-import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.datasource.okhttp.OkHttpDataSource
+import androidx.media3.exoplayer.DecoderReuseEvaluation
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.analytics.AnalyticsListener
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
+import androidx.media3.exoplayer.upstream.DefaultAllocator
+import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
 import androidx.media3.ui.PlayerView
 import androidx.tv.material3.Border
 import androidx.tv.material3.Button
@@ -100,13 +103,17 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.isActive
 import tv.vega.tv.data.ServiceLocator
+import tv.vega.tv.data.diag.DiagLog
 import tv.vega.tv.data.history.WatchEntry
+import tv.vega.tv.data.net.NetClients
 import tv.vega.tv.data.model.VegaStream
 import tv.vega.tv.player.PlaybackSession
 import tv.vega.tv.player.PlayerKeyBus
+import tv.vega.tv.player.isMovieInfo
+import tv.vega.tv.player.qualityScore
 import tv.vega.tv.ui.common.ErrorScreen
-import tv.vega.tv.ui.common.LoadingScreen
 import tv.vega.tv.ui.common.UiState
+import tv.vega.tv.ui.common.VegaSpinner
 import tv.vega.tv.ui.common.WafError
 import tv.vega.tv.ui.theme.ScrimHeavy
 import tv.vega.tv.ui.theme.VegaPrimary
@@ -115,7 +122,6 @@ private const val AUTO_HIDE_MS = 5_000L
 private const val UI_TICK_MS = 200L
 private const val SEEK_STEP_MS = 10_000L
 private const val AUTO_NEXT_SECONDS = 8
-private const val AUTO_NEXT_FRACTION = 0.98f
 private const val MIN_TRACK = 0.001f
 
 private data class Skip(val title: String, val fromMs: Long, val toMs: Long)
@@ -151,15 +157,16 @@ private class SeekCoalescer {
  *   │              ⏪ 10        ⏵ / ⏸       10 ⏩                │  center controls
  *   │                                                          │
  *   │   01:12 ────────●───────────────────────── -28:31        │  scrubber
- *   │   🎧 Audio  CC Subs  1.0x  Server  Fit  ⋯ More   Next ▶  │  action row
+ *   │  Audio CC Subs 1.0x 4K HDR …  Server  Fit  Stats  ◀ Prev  Next ▶ │  action row
  *   └──────────────────────────────────────────────────────────┘
  *
  * Keys (the remote, not the surface, drives playback — see [PlayerKeyBus]):
  *   OK          play/pause — or reveal the UI when it is hidden
- *   ← / →       ±10s when the UI is hidden or the scrubber has focus,
- *               otherwise D-pad movement between the control buttons
+ *   ← / →       seek: ±10% on the scrubber, ±10s otherwise, even while the
+ *               chrome is hidden (no UI opens) — D-pad movement only between
+ *               the other control buttons
  *   ↑ / ↓       spatial navigation / reveal the UI when hidden
- *   MENU        server · audio · subs · speed · video · find panel
+ *   MENU        server · quality · audio · subs · speed panel
  *   BACK        closes the panel, cancels auto-next, hides the UI, exits
  */
 @Composable
@@ -169,13 +176,25 @@ fun PlayerScreen(
     vm: PlayerViewModel = viewModel(),
 ) {
     val ctx = LocalContext.current
+    val displayMetrics = ctx.resources.displayMetrics
+    val displayWidth = displayMetrics.widthPixels.coerceAtLeast(1)
+    val displayHeight = displayMetrics.heightPixels.coerceAtLeast(1)
+    // Auto-quality reads this before the (slower) provider resolve completes.
+    LaunchedEffect(displayHeight) { vm.maxPlaybackHeight = displayHeight }
     val state by vm.state.collectAsStateWithLifecycle()
     val wafUrl by vm.wafUrl.collectAsStateWithLifecycle()
+    val nextError by vm.nextError.collectAsStateWithLifecycle()
+    val nextErrorTitle by vm.nextErrorTitle.collectAsStateWithLifecycle()
+    val switching by vm.switching.collectAsStateWithLifecycle()
+    // Hindi is the requested default. "auto" clears the preference and lets
+    // the source pick; a manual MENU ▸ Audio choice still wins for this stream.
+    val audioLanguage by ServiceLocator.settings.audioLanguage
+        .collectAsStateWithLifecycle(initialValue = "hi")
     val focusManager = LocalFocusManager.current
     val scope = rememberCoroutineScope()
 
     var menuOpen by remember { mutableStateOf(false) }
-    var menuTab by remember { mutableStateOf(0) } // 0 server 1 audio 2 subs 3 speed 4 video 5 find
+    var menuTab by remember { mutableStateOf(0) } // 0 server 1 quality 2 audio 3 subs 4 speed
     var positionMs by remember { mutableLongStateOf(0L) }
     var durationMs by remember { mutableLongStateOf(1L) }
     var bufferedMs by remember { mutableLongStateOf(0L) }
@@ -183,6 +202,7 @@ fun PlayerScreen(
         mutableStateOf(androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_FIT)
     }
     var playError by remember { mutableStateOf<String?>(null) }
+    var rawPlayError by remember { mutableStateOf<String?>(null) }
     // Mirrored from the player each tick *and* set on the button press itself,
     // so the play/pause glyph flips on the keypress rather than up to 200ms
     // later when the clock next runs.
@@ -216,22 +236,38 @@ fun PlayerScreen(
     var seekOsd by remember { mutableStateOf<SeekOsd?>(null) }
     var autoNextLeft by remember { mutableStateOf<Int?>(null) }
     var autoNextDismissed by remember { mutableStateOf(false) }
+    // True when the stream died at its very last bytes (a truncated final
+    // fragment, usually a lying Content-Length header). The picture is over
+    // even though the player never reached STATE_ENDED, so the auto-next
+    // countdown below must still be allowed to run.
+    var tailFailed by remember { mutableStateOf(false) }
 
-    LaunchedEffect(Unit) {
-        while (isActive) {
-            delay(UI_TICK_MS)
-            // Never hide while paused: a frozen frame with no controls reads as
-            // a crash, and every TV player keeps its chrome up when paused.
-            if (showUI && !menuOpen && playError == null && autoNextLeft == null &&
-                isPlayingNow &&
-                System.currentTimeMillis() - lastInteraction > AUTO_HIDE_MS
-            ) {
-                showUI = false
-                // Focus must leave the (now uncomposed) controls, or the next
-                // arrow press is consumed by an invisible focus target.
-                focusManager.clearFocus()
-            }
+    // A failed auto-next must stop the countdown that produced it: otherwise
+    // the loop keeps firing every cycle against the same provider error and
+    // skips episodes one at a time.
+    LaunchedEffect(nextError) {
+        if (nextError != null) {
+            autoNextDismissed = true
+            autoNextLeft = null
         }
+    }
+
+    // Auto-hide is a single timer armed while the chrome is actually up, not a
+    // 5 Hz poll for the whole movie. Every input that can reset or cancel it
+    // (an interaction, a pause, the menu) is a key of this effect, so the
+    // countdown restarts by itself and nothing runs while the controls are away.
+    LaunchedEffect(showUI, menuOpen, playError, autoNextLeft, isPlayingNow, lastInteraction) {
+        // Never hide while paused: a frozen frame with no controls reads as
+        // a crash, and every TV player keeps its chrome up when paused.
+        if (!showUI || menuOpen || playError != null || autoNextLeft != null || !isPlayingNow) {
+            return@LaunchedEffect
+        }
+        val waited = System.currentTimeMillis() - lastInteraction
+        delay((AUTO_HIDE_MS - waited).coerceAtLeast(0L))
+        showUI = false
+        // Focus must leave the (now uncomposed) controls, or the next
+        // arrow press is consumed by an invisible focus target.
+        focusManager.clearFocus()
     }
 
     // Where focus sits, so the key handler below knows whether a DPAD press is
@@ -249,17 +285,35 @@ fun PlayerScreen(
             parameters = buildUponParameters()
                 .setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, false)
                 .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
+                // HLS masters offer every ladder rung, not just the link the
+                // provider named. Cap adaptive video at the panel's own size;
+                // otherwise ExoPlayer happily pulls a 4K variant on a 1080p TV
+                // and spends the whole film dropping frames.
+                .setMaxVideoSize(displayWidth, displayHeight)
+                .setPreferredAudioLanguages(*preferredAudioCodes(audioLanguage))
                 .build()
         }
     }
+    LaunchedEffect(audioLanguage) {
+        trackSelector.parameters = trackSelector.buildUponParameters()
+            .setPreferredAudioLanguages(*preferredAudioCodes(audioLanguage))
+            .build()
+    }
     // Header-aware HTTP stack: the factory reads currentHeaders on every
     // request, so per-stream provider auth applies to media + segments.
+    //
+    // This is OkHttp rather than the platform URLConnection stack because a
+    // film makes hundreds of segment/range requests: OkHttp keeps the TLS
+    // connection and HTTP/2 stream alive between them. The platform stack
+    // re-handshakes far more often, which is exactly what turns a 1080p HLS
+    // stream into periodic 2–4s stalls on a weak TV SoC. It also routes media
+    // through the same DoH resolver the rest of the app already uses.
     val headerHttp = remember {
         object : DataSource.Factory {
             @Volatile
             var headers: Map<String, String> = emptyMap()
             override fun createDataSource(): DataSource =
-                DefaultHttpDataSource.Factory()
+                OkHttpDataSource.Factory(NetClients.http)
                     .setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0")
                     // Merged, not overwritten: a second setDefaultRequestProperties
                     // call replaces the first, which would silently drop every
@@ -277,14 +331,40 @@ fun PlayerScreen(
     // assignment below the listener would fire into a no-op and a 403 would
     // look exactly like a video that never started.
     val showError = remember { mutableStateOf<(String?) -> Unit>({}) }
-    LaunchedEffect(Unit) { showError.value = { playError = it } }
+    LaunchedEffect(Unit) { showError.value = { rawPlayError = it } }
     val player = remember {
-        ExoPlayer.Builder(ctx, DefaultRenderersFactory(ctx))
-            .setMediaSourceFactory(DefaultMediaSourceFactory(ctx).setDataSourceFactory(headerHttp))
+        ExoPlayer.Builder(
+            ctx,
+            // A preferred-decoder init failure falls back to the next decoder
+            // instead of failing the stream outright.
+            DefaultRenderersFactory(ctx).setEnableDecoderFallback(true),
+        )
+            .setMediaSourceFactory(
+                DefaultMediaSourceFactory(ctx)
+                    .setDataSourceFactory(headerHttp)
+                    // A connection dropped while re-fetching around a seek gets
+                    // a few backoff retries before the error card shows.
+                    .setLoadErrorHandlingPolicy(DefaultLoadErrorHandlingPolicy(4)),
+            )
             .setTrackSelector(trackSelector)
             .setLoadControl(
                 DefaultLoadControl.Builder()
-                    .setBufferDurationsMs(8_000, 20_000, 1_500, 3_000)
+                    // 256 KB chunks: at 4K bitrates the 64 KB default churned
+                    // thousands of small allocations per minute.
+                    .setAllocator(DefaultAllocator(true, 256 * 1024))
+                    // Hard Java-heap ceiling. Without it the time-only window
+                    // buffered up to 20s — 150-250 MB on a 60-100 Mbps 4K
+                    // file, the seek-on-a-huge-file OOM that restarts weak TV
+                    // boxes. 64 MB ≈ 8s at 60 Mbps / 30s time-cap at 15 Mbps.
+                    .setTargetBufferBytes(64 * 1024 * 1024)
+                    // min 15s, max 60s, start at 2s, resume-after-rebuffer 5s.
+                    // The old 30s ceiling ran dry during a CDN/CDN-switch
+                    // hiccup on long films; 60s gives the retry policy room
+                    // while the 64 MB cap still bounds memory on low-bitrate
+                    // streams (≈4.5 min at 2 Mbps, ≈8s at 60 Mbps).
+                    .setBufferDurationsMs(15_000, 60_000, 2_000, 5_000)
+                    // A ±5s rewind replays from RAM instead of re-fetching.
+                    .setBackBuffer(5_000, false)
                     .build(),
             )
             .build()
@@ -301,7 +381,22 @@ fun PlayerScreen(
                 // player. Start at full volume; the remote's own volume keys
                 // adjust from there.
                 p.volume = 1f
+                // The screen is kept awake by the activity, but some TV
+                // firmwares still put Wi-Fi into power-save between HLS
+                // segments. Holding the network wake lock for the duration of
+                // playback removes that source of periodic stalls.
+                p.setWakeMode(C.WAKE_MODE_NETWORK)
             }
+    }
+    DisposableEffect(Unit) {
+        PlaybackSession.playerActive = true
+        onDispose {
+            PlaybackSession.playerActive = false
+            // Player exit is the end of the exclusive playback window; Home's
+            // visibility effect is a second safety net if this screen is
+            // removed by a route rebuild.
+            PlaybackSession.playbackRequested = false
+        }
     }
     // Swap provider-authorized headers per stream.
     fun dataSourceWith(headers: Map<String, String>) {
@@ -310,6 +405,16 @@ fun PlayerScreen(
     // Wall-clock, not a coroutine: the listener below is called on the main
     // thread and must not start work of its own.
     var stalledSince by remember { mutableLongStateOf(0L) }
+    // Bumped whenever Media3 publishes a new track list. Language tags are
+    // often absent until the manifest is parsed, so the Hindi fallback must
+    // re-evaluate then, not only when the stream URL is chosen.
+    var tracksRev by remember { mutableIntStateOf(0) }
+    // Opening-only auto-failover. It must survive the player's Loading state
+    // (server retry) and the switch to Success, so it lives at screen scope,
+    // keyed to the episode rather than to one stream.
+    var autoFailoverAllowed by remember(PlaybackSession.startIndex) {
+        mutableStateOf(true)
+    }
 
     /*
      * Playback failures reach the screen here.
@@ -324,6 +429,19 @@ fun PlayerScreen(
     DisposableEffect(player) {
         val l = object : androidx.media3.common.Player.Listener {
             override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
+                // A progressive stream whose server lies about Content-Length —
+                // or a CDN that truncates the final fragment — fails at the
+                // last byte with "length=…, bytesRead=-1". The episode has
+                // played out; replacing the finished picture with a card the
+                // viewer cannot act on is noise. Mark the tail failure so the
+                // auto-next countdown still fires, and show nothing.
+                val d = player.duration
+                if (player.playbackState == androidx.media3.common.Player.STATE_ENDED ||
+                    (d > 0 && player.currentPosition >= d - 2_000L)
+                ) {
+                    tailFailed = true
+                    return
+                }
                 val cause = error.errorCodeName + ": " +
                     (error.cause?.message ?: error.localizedMessage ?: "unknown")
                 showError.value(cause.take(200))
@@ -335,7 +453,28 @@ fun PlayerScreen(
                 stalledSince = if (playbackState == androidx.media3.common.Player.STATE_BUFFERING) {
                     System.currentTimeMillis()
                 } else 0L
+                // READY is the point after which auto-failover must stop.
+                // Set it directly from the callback rather than polling.
+                if (playbackState == androidx.media3.common.Player.STATE_READY) {
+                    autoFailoverAllowed = false
+                }
             }
+
+            override fun onIsPlayingChanged(isPlaying: Boolean) {
+                if (!isPlaying) return
+                // A stream that produced even a second of video has started:
+                // from now on only the viewer may change servers.
+                autoFailoverAllowed = false
+                // Playback owns the box now; tear down the hidden provider
+                // WebView until the next provider call rebuilds it lazily.
+                ServiceLocator.providers.js.suspendForPlayback()
+            }
+
+            override fun onTracksChanged(tracks: androidx.media3.common.Tracks) {
+                tracksRev++
+            }
+
+
         }
         player.addListener(l)
         onDispose { player.removeListener(l) }
@@ -346,12 +485,53 @@ fun PlayerScreen(
     // number no getter exposes: cumulative dropped frames.
     DisposableEffect(player) {
         val l = object : AnalyticsListener {
+            private var lastFormat = ""
+
             override fun onDroppedVideoFrames(
                 eventTime: AnalyticsListener.EventTime,
                 droppedFrames: Int,
                 elapsedMs: Long,
             ) {
                 statsDropped = droppedFrames
+            }
+
+            // The forensic trail for decoder-level failures: when a hardware
+            // decoder takes the whole box down on a seek, the TV reboots
+            // before any handler runs — but this note was written when the
+            // decoder started and survives to the next launch.
+            override fun onVideoInputFormatChanged(
+                eventTime: AnalyticsListener.EventTime,
+                format: Format,
+                decoderReuseEvaluation: DecoderReuseEvaluation?,
+            ) {
+                lastFormat = buildString {
+                    append(format.sampleMimeType ?: "?")
+                    append(' ').append(format.width).append('x').append(format.height)
+                    format.frameRate?.takeIf { it > 0f }?.let { append(" @").append(it.toInt()).append("fps") }
+                    format.bitrate?.takeIf { it > 0 }?.let { append(' ').append(it / 1_000_000).append(" Mbps") }
+                    if (format.colorInfo != null) append(" hdr")
+                }
+            }
+
+            override fun onVideoDecoderInitialized(
+                eventTime: AnalyticsListener.EventTime,
+                decoderName: String,
+                initializationDurationMs: Long,
+            ) {
+                noteDecoder(decoderName)
+            }
+
+            override fun onVideoDecoderInitialized(
+                eventTime: AnalyticsListener.EventTime,
+                decoderName: String,
+                initializedTimestampMs: Long,
+                initializationDurationMs: Long,
+            ) {
+                noteDecoder(decoderName)
+            }
+
+            private fun noteDecoder(decoderName: String) {
+                DiagLog.notePlayback(ctx, "decoder=$decoderName\nformat=$lastFormat")
             }
         }
         player.addAnalyticsListener(l)
@@ -371,10 +551,10 @@ fun PlayerScreen(
      * returns false and lets Compose navigate. When the controls are hidden —
      * or the scrubber is the thing focused — the arrows belong to playback.
      */
-    DisposableEffect(player, menuOpen, showUI, controlFocused, scrubberFocused) {
+    DisposableEffect(player, state, menuOpen, showUI, controlFocused, scrubberFocused) {
         fun playing() = player.playbackState != androidx.media3.common.Player.STATE_IDLE
 
-        fun seekBy(ms: Long): Boolean {
+        fun seekBy(ms: Long, clampMs: Long = 10 * 60_000L): Boolean {
             if (!playing()) return false
             // TV remotes emit repeated key events in bursts. Coalesce them so
             // the decoder performs one seek instead of thrashing on every key.
@@ -382,7 +562,7 @@ fun PlayerScreen(
             // in this effect: the effect is re-keyed the moment the UI shows
             // and anything owned by it would be cancelled mid-seek.
             val c = seekCoalescer
-            c.pendingMs = (c.pendingMs + ms).coerceIn(-10 * 60_000L, 10 * 60_000L)
+            c.pendingMs = (c.pendingMs + ms).coerceIn(-clampMs, clampMs)
             val d = player.duration
             val target = (player.currentPosition + c.pendingMs)
                 .coerceIn(0L, if (d > 0) d else Long.MAX_VALUE)
@@ -396,58 +576,92 @@ fun PlayerScreen(
             // a target that has not been reached yet.
             seekOsd = SeekOsd(if (c.pendingMs < 0) -1 else 1, target, c.pendingMs)
             showError.value(null)
-            touch()
+            // Seeking is playback, not chrome: bump the auto-hide clock only.
+            // Opening the whole control set on every LEFT/RIGHT would cover the
+            // picture the viewer is trying to scrub through.
+            lastInteraction = System.currentTimeMillis()
             return true
         }
 
+        // The focused scrubber owns LEFT/RIGHT: one press is ±10% of the full
+        // duration (accumulated across a burst), the timeline convention of
+        // every streaming player. A 10% step of a long film exceeds the 10-
+        // minute burst clamp the fixed-step seeks use, hence clampMs = d.
+        fun scrubByFraction(fraction: Float): Boolean {
+            if (!playing()) return false
+            val d = player.duration
+            if (d <= 0) return true
+            return seekBy((d * fraction).toLong(), clampMs = d)
+        }
+
         val onKey: (Int) -> Boolean = { key ->
-            when (key) {
+            if (state !is UiState.Success || playError != null || nextError != null) {
+                // Loading and full-screen error screens own the remote: their
+                // Retry buttons must receive OK and the D-pad before transport.
+                false
+            } else when (key) {
                 android.view.KeyEvent.KEYCODE_DPAD_CENTER,
                 android.view.KeyEvent.KEYCODE_ENTER,
                 -> {
-                    if (!showUI) {
-                        // Hidden: the first press only reveals the UI, so an
-                        // accidental OK does not pause what is being watched.
-                        touch()
-                        true
-                    } else if (menuOpen || controlFocused) {
-                        // A button owns this press.
-                        false
-                    } else {
-                        // Controls up, focus not on one of them (scrubber,
-                        // nowhere): OK stays the universal play/pause.
-                        if (player.isPlaying) player.pause() else player.play()
-                        isPlayingNow = !isPlayingNow
-                        touch()
-                        true
+                    when {
+                        // The auto-next card owns OK while it is up: it has its
+                        // own Play now / Cancel buttons, focused and visible
+                        // over the ended picture.
+                        autoNextLeft != null -> false
+                        !showUI -> {
+                            // Hidden: the first press only reveals the UI, so
+                            // an accidental OK does not pause what is watched.
+                            touch()
+                            true
+                        }
+                        menuOpen || controlFocused -> {
+                            // Navigating the chrome is interaction too: without
+                            // this the bar auto-hides under the remote's focus.
+                            touch()
+                            false
+                        }
+                        else -> {
+                            // Controls up, focus not on one of them (scrubber,
+                            // nowhere): OK stays the universal play/pause.
+                            if (player.isPlaying) player.pause() else player.play()
+                            isPlayingNow = !isPlayingNow
+                            touch()
+                            true
+                        }
                     }
                 }
 
-                // Menu open means focus is on the panel, and LEFT/RIGHT are
-                // spatial navigation between its buttons there. Stepping the play
-                // head instead would fight the D-pad the user is actually using.
+                // Menu open means focus is on the panel, and the overlay card
+                // means focus is on its buttons: LEFT/RIGHT are spatial
+                // navigation there, not transport.
                 android.view.KeyEvent.KEYCODE_DPAD_LEFT ->
                     when {
+                        autoNextLeft != null -> false
                         !showUI -> seekBy(-SEEK_STEP_MS) || true
                         menuOpen -> false
-                        controlFocused -> false
-                        else -> seekBy(-SEEK_STEP_MS)
+                        scrubberFocused -> scrubByFraction(-0.1f)
+                        else -> { touch(); false }
                     }
                 android.view.KeyEvent.KEYCODE_DPAD_RIGHT ->
                     when {
+                        autoNextLeft != null -> false
                         !showUI -> seekBy(SEEK_STEP_MS) || true
                         menuOpen -> false
-                        controlFocused -> false
-                        else -> seekBy(SEEK_STEP_MS)
+                        scrubberFocused -> scrubByFraction(0.1f)
+                        else -> { touch(); false }
                     }
                 android.view.KeyEvent.KEYCODE_DPAD_UP,
                 android.view.KeyEvent.KEYCODE_DPAD_DOWN,
                 -> {
-                    // Any D-pad press shows UI if hidden
-                    if (!showUI) {
+                    // Any D-pad press shows UI if hidden; the auto-next card
+                    // keeps its own spatial navigation.
+                    if (autoNextLeft != null) {
+                        false
+                    } else if (!showUI) {
                         touch()
                         true
                     } else {
+                        touch()
                         false // Let normal navigation happen
                     }
                 }
@@ -480,8 +694,18 @@ fun PlayerScreen(
                 }
                 android.view.KeyEvent.KEYCODE_MEDIA_PREVIOUS -> {
                     if (playing()) {
-                        // Standard media convention: restart the current item.
-                        player.seekTo(0)
+                        // Standard media convention: past the first few seconds
+                        // this restarts the current item; at its very start
+                        // (the just-started case) it steps back when there is a
+                        // predecessor, and stays a plain restart on the first.
+                        if (player.currentPosition > 5_000 ||
+                            PlaybackSession.startIndex <= 0 ||
+                            PlaybackSession.episodes.isEmpty()
+                        ) {
+                            player.seekTo(0)
+                        } else {
+                            vm.prev()
+                        }
                         touch()
                         true
                     } else false
@@ -510,6 +734,12 @@ fun PlayerScreen(
     DisposableEffect(Unit) {
         PlayerKeyBus.onBack = {
             when {
+                playError != null || nextError != null -> {
+                    // The failure card's own Back leaves the player; the remote's
+                    // BACK must do the same instead of only hiding the chrome.
+                    onBack()
+                    true
+                }
                 menuOpen -> {
                     menuOpen = false
                     touch()
@@ -521,15 +751,16 @@ fun PlayerScreen(
                     true
                 }
                 showUI -> {
-                    // With controls visible, BACK has the standard TV meaning:
-                    // leave playback. When controls are hidden, the first BACK
-                    // reveals them so an accidental press is recoverable.
-                    onBack()
+                    // First BACK puts the controls away; a second one exits.
+                    // Leaving playback on the first press made BACK feel like
+                    // the chrome was blocking the way out.
+                    showUI = false
+                    focusManager.clearFocus()
                     true
                 }
                 else -> {
-                    // Give the user one visible, predictable step before exit.
-                    touch()
+                    // Chrome already hidden: BACK means leave playback.
+                    onBack()
                     true
                 }
             }
@@ -575,68 +806,86 @@ fun PlayerScreen(
     }
 
     // One clock for the chrome: position, duration, buffered amount, and the
-    // 5s progress save. 200ms keeps the scrubber from visibly stepping while
-    // staying far below one frame of a remote's repeat rate.
+    // 10s progress save. 200ms keeps the scrubber from visibly stepping while
+    // staying far below one frame of a remote's repeat rate. While nothing on
+    // screen reads the values — chrome and stats both hidden — the state writes
+    // (and the stats rebuild behind them) are skipped, so a full-screen movie
+    // costs the decoder, not the UI thread; the resume checkpoint still ticks.
     LaunchedEffect(Unit) {
         var lastSave = 0L
         while (isActive) {
             delay(UI_TICK_MS)
-            positionMs = player.currentPosition.coerceAtLeast(0L)
-            val d = player.duration
-            if (d > 0) durationMs = d
-            bufferedMs = player.bufferedPosition
+            if (showUI || menuOpen || statsOpen) {
+                positionMs = player.currentPosition.coerceAtLeast(0L)
+                val d = player.duration
+                if (d > 0) durationMs = d
+                bufferedMs = player.bufferedPosition
+                speedNow = player.playbackParameters.speed
+                // Stats overlay, only rebuilt into state when the text actually
+                // changes, so a 60 fps decode does not recompose the chrome.
+                val vf = player.videoFormat
+                val vLine = vf?.let { f ->
+                    buildString {
+                        if (f.width > 0 && f.height > 0) append("${f.width}×${f.height}")
+                        if (f.frameRate > 0f) {
+                            if (isNotEmpty()) append(" · ")
+                            append("${f.frameRate.toInt()} fps")
+                        }
+                        f.sampleMimeType?.let {
+                            if (isNotEmpty()) append(" · ")
+                            append(it.substringAfter('/'))
+                        }
+                        if (f.bitrate > 0) {
+                            if (isNotEmpty()) append(" · ")
+                            append("${f.bitrate / 1000} kbps")
+                        }
+                    }
+                }.orEmpty()
+                if (vLine != statsVideo) statsVideo = vLine
+                val af = player.audioFormat
+                val aLine = af?.let { f ->
+                    buildString {
+                        f.sampleMimeType?.let { append(it.substringAfter('/')) }
+                        if (f.channelCount > 0) {
+                            if (isNotEmpty()) append(" · ")
+                            append("${f.channelCount}ch")
+                        }
+                        if (f.sampleRate > 0) {
+                            if (isNotEmpty()) append(" · ")
+                            append("${f.sampleRate / 1000} kHz")
+                        }
+                        if (f.bitrate > 0) {
+                            if (isNotEmpty()) append(" · ")
+                            append("${f.bitrate / 1000} kbps")
+                        }
+                    }
+                }.orEmpty()
+                if (aLine != statsAudio) statsAudio = aLine
+            }
             isPlayingNow = player.isPlaying
-            speedNow = player.playbackParameters.speed
-            // Stats overlay, only rebuilt into state when the text actually
-            // changes, so a 60 fps decode does not recompose the chrome.
-            val vf = player.videoFormat
-            val vLine = vf?.let { f ->
-                buildString {
-                    if (f.width > 0 && f.height > 0) append("${f.width}×${f.height}")
-                    if (f.frameRate > 0f) {
-                        if (isNotEmpty()) append(" · ")
-                        append("${f.frameRate.toInt()} fps")
-                    }
-                    f.sampleMimeType?.let {
-                        if (isNotEmpty()) append(" · ")
-                        append(it.substringAfter('/'))
-                    }
-                    if (f.bitrate > 0) {
-                        if (isNotEmpty()) append(" · ")
-                        append("${f.bitrate / 1000} kbps")
-                    }
-                }
-            }.orEmpty()
-            if (vLine != statsVideo) statsVideo = vLine
-            val af = player.audioFormat
-            val aLine = af?.let { f ->
-                buildString {
-                    f.sampleMimeType?.let { append(it.substringAfter('/')) }
-                    if (f.channelCount > 0) {
-                        if (isNotEmpty()) append(" · ")
-                        append("${f.channelCount}ch")
-                    }
-                    if (f.sampleRate > 0) {
-                        if (isNotEmpty()) append(" · ")
-                        append("${f.sampleRate / 1000} kHz")
-                    }
-                    if (f.bitrate > 0) {
-                        if (isNotEmpty()) append(" · ")
-                        append("${f.bitrate / 1000} kbps")
-                    }
-                }
-            }.orEmpty()
-            if (aLine != statsAudio) statsAudio = aLine
-            val streaming = PlaybackSession.episodes.isNotEmpty()
-            if (streaming && positionMs - lastSave > 5_000 && durationMs > 0) {
-                lastSave = positionMs
-                saveProgress(positionMs, durationMs)
+            // Continue Watching can enter with no rebuilt episode list; the
+            // pending link is still a streamed title, so its checkpoint must
+            // keep ticking. (The final onDispose flush alone lost hours of
+            // progress if the app was killed mid-film.)
+            val streaming = PlaybackSession.episodes.isNotEmpty() ||
+                PlaybackSession.pendingLink.isNotBlank()
+            val pos = player.currentPosition
+            val d = player.duration
+            if (streaming && pos - lastSave > 10_000 && d > 0) {
+                lastSave = pos
+                saveProgress(pos, d)
             }
         }
     }
 
     when (val s = state) {
-        is UiState.Loading -> LoadingScreen(Modifier.fillMaxSize())
+        is UiState.Loading -> PlayerLoading(
+            title = PlaybackSession.title.ifBlank { PlaybackSession.pendingTitle },
+            episode = PlaybackSession.pendingEpisodeTitle.ifBlank {
+                PlaybackSession.episodes.getOrNull(PlaybackSession.startIndex)?.title.orEmpty()
+            },
+            modifier = Modifier.fillMaxSize(),
+        )
         is UiState.Error -> WafError(
             message = s.message,
             wafUrl = wafUrl,
@@ -651,6 +900,121 @@ fun PlayerScreen(
                 return
             }
             val sel = streams.getOrNull(vm.selectedIndex) ?: streams[0]
+            // Selecting the server that is already playing (common after the
+            // failure card sends the viewer to the list) must reload it too.
+            // Changing `selectedIndex` back to the same value would otherwise
+            // recompose to an identical link and do nothing at all.
+            var mediaRev by remember { mutableIntStateOf(0) }
+
+            // Many Indian providers leave the audio track language as "und"
+            // and only label it "Hindi". Preferred-language matching cannot
+            // see that, so after the first real track list arrives, pick the
+            // Hindi-labelled track explicitly. Runs once per stream; a later
+            // manual MENU -> Audio choice is never overridden.
+            var audioAppliedFor by remember { mutableStateOf("") }
+            LaunchedEffect(sel.link, tracksRev, audioLanguage) {
+                if (audioAppliedFor == sel.link) return@LaunchedEffect
+                val groups = player.currentTracks.groups.filter { it.type == C.TRACK_TYPE_AUDIO }
+                if (groups.isEmpty()) return@LaunchedEffect
+                val selectedIsPreferred = groups.any { g ->
+                    g.isSelected && (0 until g.length).any {
+                        audioTrackMatches(g.getTrackFormat(it), audioLanguage)
+                    }
+                }
+                val preferred = groups.firstNotNullOfOrNull { g ->
+                    (0 until g.length).firstOrNull { i ->
+                        audioTrackMatches(g.getTrackFormat(i), audioLanguage)
+                    }?.let { i -> g to i }
+                }
+                audioAppliedFor = sel.link
+                var params = trackSelector.buildUponParameters()
+                    .clearOverridesOfType(C.TRACK_TYPE_AUDIO)
+                if (!selectedIsPreferred && preferred != null) {
+                    params = params.setOverrideForType(
+                        TrackSelectionOverride(preferred.first.mediaTrackGroup, preferred.second),
+                    )
+                }
+                trackSelector.parameters = params.build()
+            }
+
+            // Automatic server failover is an opening-only convenience. It is
+            // allowed while the chosen stream has never reached READY; once
+            // playback has actually started (or the viewer picked a server),
+            // an error must show the card instead of silently jumping to
+            // another server. That prevents a slow/buffering server from being
+            // abandoned mid-film without the viewer's consent.
+            var failedLinks by remember(PlaybackSession.startIndex) {
+                mutableStateOf(emptySet<String>())
+            }
+            var failoverLabel by remember { mutableStateOf<String?>(null) }
+
+            LaunchedEffect(rawPlayError, sel.link) {
+                val reason = rawPlayError ?: return@LaunchedEffect
+                // The media id, not `sel`, is what actually failed: an error
+                // can arrive in the same frame as a failover recomposition.
+                val currentLink = player.currentMediaItem?.mediaId
+                    ?.takeIf { it.isNotBlank() }
+                    ?: sel.link
+                val failed = failedLinks + currentLink
+                failedLinks = failed
+                if (!autoFailoverAllowed) {
+                    // Playback had already started (or the viewer chose this
+                    // server): stop here and make the choice explicit.
+                    failoverLabel = null
+                    playError = reason
+                    showUI = true
+                    touch()
+                    return@LaunchedEffect
+                }
+                val currentIndex = streams.indexOfFirst { it.link == currentLink }
+                    .takeIf { it >= 0 } ?: vm.selectedIndex
+                // Never retry the same URL automatically: the player already
+                // exhausted its internal retries before reporting the error.
+                val next = streams.indices
+                    .map { (currentIndex + it + 1) % streams.size }
+                    .firstOrNull { i ->
+                        val candidate = streams[i]
+                        candidate.link.isNotBlank() &&
+                            candidate.link != currentLink &&
+                            candidate.link !in failed
+                    }
+                if (next == null) {
+                    failoverLabel = null
+                    playError = reason
+                    showUI = true
+                    touch()
+                } else {
+                    // A failed ExoPlayer source is already IDLE, which is the
+                    // one case where the media effect uses the session resume
+                    // value instead of the live position. Capture it first.
+                    val pos = player.currentPosition
+                    if (pos > 0) PlaybackSession.resumePositionMs = pos
+                    failoverLabel = "Trying another server…"
+                    rawPlayError = null
+                    vm.selectFailover(next)
+                    touch()
+                }
+            }
+
+            LaunchedEffect(sel.link) {
+                while (failoverLabel != null &&
+                    player.playbackState != androidx.media3.common.Player.STATE_READY &&
+                    player.playbackState != androidx.media3.common.Player.STATE_ENDED &&
+                    playError == null
+                ) {
+                    delay(200)
+                }
+                failoverLabel = null
+            }
+
+            // A reloaded source that keeps playing earns every server back:
+            // a transient CDN error hours into a film must not permanently
+            // poison the list for the rest of the episode.
+            LaunchedEffect(sel.link, isPlayingNow) {
+                if (!isPlayingNow) return@LaunchedEffect
+                delay(60_000)
+                if (player.currentMediaItem?.mediaId == sel.link) failedLinks = emptySet()
+            }
 
             // External-player setting (mirrors web useExternalPlayer).
             LaunchedEffect(sel.link) {
@@ -666,7 +1030,7 @@ fun PlayerScreen(
             // Two provider servers can legally expose the same URL with
             // different cookies/referer/token headers. Key on headers too, or
             // switching servers appears to do nothing and keeps the old auth.
-            LaunchedEffect(sel.link, sel.headers, subsRev) {
+            LaunchedEffect(sel.link, sel.headers, subsRev, mediaRev) {
                 if (sel.link.isBlank()) return@LaunchedEffect
                 runCatching {
                     dataSourceWith(sel.headers)
@@ -687,9 +1051,18 @@ fun PlayerScreen(
                             .build()
                     }
                     val item = MediaItem.Builder().setUri(sel.link)
+                        // Lets auto-next prove the ENDED it sees belongs to the
+                        // link that is still loaded, not to the player that is
+                        // being replaced.
+                        .setMediaId(sel.link)
                         .setSubtitleConfigurations(subs).build()
                     player.setMediaItem(item)
                     player.prepare()
+                    // The stream is selected: tear down the provider WebView
+                    // now rather than waiting for the first isPlaying tick, so
+                    // its JS/network work cannot compete with the first
+                    // seconds of decoding.
+                    ServiceLocator.providers.js.suspendForPlayback()
                     if (keep > 5000) player.seekTo(keep)
                     player.play()
                 }
@@ -709,27 +1082,64 @@ fun PlayerScreen(
                     0L
                 }
             }
+            // Do not reveal the chrome when a buffer crosses the slow-server
+            // threshold: it used to pop up just as the stall ended (the tick
+            // that noticed 6s often lands after READY), covering the resumed
+            // picture. The spinner and the hint below stay visible on their
+            // own, and MENU still opens the server panel directly.
             val skips = remember(sel) { collectSkips(sel) }
             val hasNext =
                 PlaybackSession.startIndex + 1 < PlaybackSession.episodes.size
-            val showNext = hasNext && durationMs > 0 && positionMs.toFloat() / durationMs > 0.8f
+            val hasPrev = PlaybackSession.startIndex > 0
 
             PlayerChrome(
                 player = player,
                 trackSelector = trackSelector,
                 playError = playError,
+                nextError = nextError,
+                nextErrorTitle = nextErrorTitle,
+                switching = switching,
+                fallbackLabel = failoverLabel,
+                onRetryNext = { vm.retryAdvance() },
+                onDismissNextError = vm::dismissNextError,
                 streams = streams,
                 selectedIndex = vm.selectedIndex,
                 onServerSelect = {
                     vm.selectedIndex = it
+                    mediaRev++
                     playError = null
+                    rawPlayError = null
+                    failoverLabel = null
+                    failedLinks = emptySet()
+                    // A deliberate choice is not an "initial open" anymore.
+                    autoFailoverAllowed = false
                     touch()
                 },
+                onQualityLink = {
+                    playError = null
+                    rawPlayError = null
+                    failoverLabel = null
+                    failedLinks = emptySet()
+                    autoFailoverAllowed = false
+                    vm.switchLink(it)
+                },
                 title = PlaybackSession.title.ifBlank { PlaybackSession.pendingTitle },
-                episodeLabel = PlaybackSession.episodes
-                    .getOrNull(PlaybackSession.startIndex)
-                    ?.let { episodeSubtitle(it) }
-                    .orEmpty(),
+                // A movie has one item, and its title is a rendition label
+                // ("4K HDR …"): "Episode 1 · …" would be nonsense. A direct
+                // Continue Watching launch has no meta object, so fall back to
+                // the saved type and the saved episode label.
+                episodeLabel = if (
+                    PlaybackSession.info?.let { isMovieInfo(it) } == true ||
+                    (PlaybackSession.info == null &&
+                        PlaybackSession.pendingType.equals("movie", true))
+                ) {
+                    ""
+                } else {
+                    PlaybackSession.episodes
+                        .getOrNull(PlaybackSession.startIndex)
+                        ?.let { episodeSubtitle(it) }
+                        ?: PlaybackSession.pendingEpisodeTitle
+                },
                 serverLabel = streamLabel(sel),
                 positionMs = positionMs,
                 durationMs = durationMs,
@@ -745,7 +1155,7 @@ fun PlayerScreen(
                 statsDropped = statsDropped,
                 onToggleStats = { statsOpen = !statsOpen; touch() },
                 hasNext = hasNext,
-                showNext = showNext,
+                hasPrev = hasPrev,
                 autoNextLeft = autoNextLeft,
                 autoNextTitle = PlaybackSession.episodes
                     .getOrNull(PlaybackSession.startIndex + 1)
@@ -769,7 +1179,8 @@ fun PlayerScreen(
                     touch()
                 },
                 onSeekOsd = seekOsd,
-                onNext = { vm.next() },
+                onNext = { vm.next(); touch() },
+                onPrev = { vm.prev(); touch() },
                 onCancelAutoNext = {
                     autoNextDismissed = true
                     autoNextLeft = null
@@ -788,6 +1199,10 @@ fun PlayerScreen(
                 },
                 onRetryError = {
                     playError = null
+                    rawPlayError = null
+                    failoverLabel = null
+                    failedLinks = emptySet()
+                    autoFailoverAllowed = false
                     // Re-resolve the source: signed URLs and challenge
                     // cookies commonly expire, so preparing the same URL
                     // would repeat a 403 forever.
@@ -795,6 +1210,8 @@ fun PlayerScreen(
                 },
                 onSwitchServer = {
                     playError = null
+                    rawPlayError = null
+                    failoverLabel = null
                     menuTab = 0
                     menuOpen = true
                     showUI = true
@@ -818,18 +1235,44 @@ fun PlayerScreen(
             // Auto-next: only when the episode really is finishing. Dismissal is
             // per-episode, so a rewind after "Next episode now" does not restart
             // the countdown the user just said no to.
-            LaunchedEffect(sel.link) { autoNextDismissed = false }
-            LaunchedEffect(hasNext, autoNextDismissed, menuOpen) {
+            LaunchedEffect(sel.link) {
+                autoNextDismissed = false
+                tailFailed = false
+            }
+            LaunchedEffect(hasNext, autoNextDismissed, menuOpen, switching, sel.link) {
+                // While the next episode resolves, the outgoing player is still
+                // ENDED. Counting against it queued a second countdown (for the
+                // episode after next) that vanished when the real jump landed:
+                // the "episode 2 … then episode 3 … then episode 2 plays" box.
+                if (switching != null) {
+                    autoNextLeft = null
+                    return@LaunchedEffect
+                }
                 while (isActive) {
                     delay(1000)
                     val d = player.duration
                     // `playWhenReady` rather than `isPlaying`: a video that has
                     // just reached its end reports isPlaying == false, and that
-                    // is exactly the moment the next episode is wanted.
+                    // is exactly the moment the next episode is wanted. A tail
+                    // failure skips the liveness check, because the error that
+                    // ended it has already put the player back into IDLE.
+                    val live = player.playWhenReady &&
+                        player.playbackState != androidx.media3.common.Player.STATE_IDLE
+                    // Only the real end of the stream starts the countdown.
+                    // Treating the last few percent as "finishing" cut the
+                    // final minute of every episode — the credits, in a show,
+                    // but also the payoff of a cliffhanger.
+                    // The ENDED state must also belong to the selected link:
+                    // between "next" and the new media being set, the outgoing
+                    // player still reports the old episode's end.
+                    val loaded = player.currentMediaItem?.mediaId == sel.link
+                    val ended = loaded && (
+                        tailFailed ||
+                            player.playbackState == androidx.media3.common.Player.STATE_ENDED ||
+                            player.currentPosition >= d - 1_500
+                        )
                     val finishing = hasNext && !autoNextDismissed && !menuOpen && d > 0 &&
-                        player.playWhenReady &&
-                        player.playbackState != androidx.media3.common.Player.STATE_IDLE &&
-                        player.currentPosition >= d * AUTO_NEXT_FRACTION
+                        (live || tailFailed) && ended
                     if (finishing) {
                         val left = autoNextLeft
                         if (left == null) autoNextLeft = AUTO_NEXT_SECONDS
@@ -862,9 +1305,16 @@ private fun PlayerChrome(
     player: ExoPlayer,
     trackSelector: DefaultTrackSelector,
     playError: String?,
+    nextError: String?,
+    nextErrorTitle: String,
+    switching: String?,
+    fallbackLabel: String?,
+    onRetryNext: () -> Unit,
+    onDismissNextError: () -> Unit,
     streams: List<VegaStream>,
     selectedIndex: Int,
     onServerSelect: (Int) -> Unit,
+    onQualityLink: (String) -> Unit,
     title: String,
     episodeLabel: String,
     serverLabel: String,
@@ -882,7 +1332,7 @@ private fun PlayerChrome(
     statsDropped: Int,
     onToggleStats: () -> Unit,
     hasNext: Boolean,
-    showNext: Boolean,
+    hasPrev: Boolean,
     autoNextLeft: Int?,
     autoNextTitle: String,
     onPlayPause: () -> Unit,
@@ -890,6 +1340,7 @@ private fun PlayerChrome(
     onSeekBy: (Long) -> Unit,
     onSeekOsd: SeekOsd?,
     onNext: () -> Unit,
+    onPrev: () -> Unit,
     onCancelAutoNext: () -> Unit,
     onExit: () -> Unit,
     resizeMode: Int,
@@ -914,16 +1365,28 @@ private fun PlayerChrome(
     // The frame-rate cap setting, actually applied to the surface below.
     val maxFps by ServiceLocator.settings.maxFps
         .collectAsStateWithLifecycle(initialValue = "auto")
+    // Distinct qualities the provider offered, best first, each mapped to its
+    // best stream: the quality dropdown is the server list minus server names.
+    // Movie quality cards are whole alternate links and are appended.
+    val choices = remember(streams) { qualityChoices(streams) }
+    val currentEpLink = PlaybackSession.episodes
+        .getOrNull(PlaybackSession.startIndex)?.link.orEmpty()
+    val currentQuality = PlaybackSession.qualityAlternates
+        .firstOrNull { it.link == currentEpLink }?.label
+        ?: (streams.getOrNull(selectedIndex)?.quality ?: "").trim().ifBlank { "Auto" }
 
     // How many control regions (top bar, center row, action row) hold focus.
     // A counter, not a boolean: while focus moves between regions, one fires
     // "lost" and another fires "gained", and only the running total is stable.
     var controlFocusCount by remember { mutableIntStateOf(0) }
 
-    LaunchedEffect(showUI, menuOpen) {
-        if (showUI && !menuOpen) {
+    LaunchedEffect(showUI, menuOpen, switching) {
+        if (showUI && !menuOpen && switching == null) {
+            // Also restores focus after a jump: the chrome is withdrawn while
+            // the next source resolves, taking the focused Next/Prev button
+            // with it.
             runCatching { playFocus.requestFocus() }
-        } else {
+        } else if (!showUI || menuOpen) {
             // Controls leaving the screen must not leave a phantom focus count.
             controlFocusCount = 0
             onControlFocus(false)
@@ -948,6 +1411,11 @@ private fun PlayerChrome(
                     useController = false
                     setShowNextButton(false)
                     setShowPreviousButton(false)
+                    // A quality/server switch must not flash a black surface
+                    // while the new manifest resolves; the last frame stays up
+                    // under the loading pill until the first new frame arrives.
+                    setKeepContentOnPlayerReset(true)
+                    setShutterBackgroundColor(android.graphics.Color.BLACK)
                 }
             },
             update = {
@@ -962,10 +1430,31 @@ private fun PlayerChrome(
 
         if (playError != null) {
             PlaybackError(
+                title = "Playback stopped",
                 message = playError,
+                retryLabel = "Retry this server",
+                serverLabel = "Choose another server",
                 onRetry = onRetryError,
                 onServer = onSwitchServer,
                 onClose = onExit,
+                modifier = Modifier.align(Alignment.Center),
+            )
+            return@Box
+        }
+
+        // Auto-next resolve failure: the finished episode stays up behind this
+        // card, so the viewer can retry, pick another episode, or keep the
+        // frame they already watched — never a dead-end error screen.
+        if (nextError != null) {
+            PlaybackError(
+                title = nextErrorTitle,
+                message = nextError,
+                retryLabel = "Try again",
+                onRetry = onRetryNext,
+                serverLabel = "Choose episode",
+                onServer = onExit,
+                closeLabel = "Close",
+                onClose = onDismissNextError,
                 modifier = Modifier.align(Alignment.Center),
             )
             return@Box
@@ -991,15 +1480,17 @@ private fun PlayerChrome(
         // Buffering: a spinner is only honest for the first seconds; after that
         // the honest label is the stall, because a TV that buffers for a minute
         // while showing a spinner looks identical to one that is working.
-        if (isBuffering) {
+        if (isBuffering && switching == null) {
             Column(
                 Modifier.align(Alignment.Center),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
-                BufferingSpinner()
-                if (bufferingSlow && showUI) {
+                VegaSpinner()
+                if (bufferingSlow) {
+                    // Keep the choice visible even after the chrome auto-hides:
+                    // a stalled server must never look like an idle spinner.
                     Text(
-                        "This server is slow — MENU ▸ Server to try another",
+                        "This server is slow — press MENU ▸ Server to choose another",
                         style = MaterialTheme.typography.bodySmall,
                         color = Color(0xCCFFFFFF),
                         modifier = Modifier.padding(top = 12.dp),
@@ -1008,16 +1499,40 @@ private fun PlayerChrome(
             }
         }
 
-        // Skip stays reachable while the chrome is hidden: an intro the viewer
-        // has already seen once is the one control they want without pressing
-        // anything to wake the screen up.
-        val activeSkip = skips.firstOrNull { positionMs >= it.fromMs && positionMs < it.toMs }
-        if (activeSkip != null && !menuOpen) {
-            Button(
-                onClick = { player.seekTo(activeSkip.toMs); onTouch() },
-                modifier = Modifier.align(Alignment.BottomEnd)
-                    .padding(end = 28.dp, bottom = if (showUI) 150.dp else 28.dp),
-            ) { Text("Skip ${activeSkip.title.ifBlank { "Intro" }}".trim()) }
+        // Immediate acknowledgement of Prev/Next/quality: resolving the next
+        // source can take seconds, and the old behaviour left the finished
+        // frame (or the old stream) on screen with no sign anything happened.
+        // This stays up through auto-hide; it is the only feedback until the
+        // new media is ready.
+        val busyLabel = switching ?: fallbackLabel
+        if (busyLabel != null) {
+            Column(
+                Modifier.align(Alignment.Center)
+                    .clip(RoundedCornerShape(18.dp))
+                    .background(Color(0xE614100F))
+                    .padding(horizontal = 32.dp, vertical = 24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                VegaSpinner()
+                Text(
+                    busyLabel,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Color.White,
+                    modifier = Modifier.padding(top = 14.dp),
+                )
+            }
+        }
+
+        // Skip stays reachable while the chrome is hidden, so it carries its
+        // own coarse clock — the chrome tick is parked when the UI is away.
+        if (!menuOpen && skips.isNotEmpty()) {
+            SkipChip(
+                player = player,
+                skips = skips,
+                showUI = showUI,
+                onTouch = onTouch,
+                modifier = Modifier.align(Alignment.BottomEnd),
+            )
         }
 
         // Stats stays up through auto-hide: it is something you turned on *to*
@@ -1038,7 +1553,7 @@ private fun PlayerChrome(
             )
         }
 
-        if (autoNextLeft != null && !menuOpen) {
+        if (autoNextLeft != null && !menuOpen && switching == null) {
             AutoNextOverlay(
                 secondsLeft = autoNextLeft,
                 title = autoNextTitle.ifBlank { "Next episode" },
@@ -1048,14 +1563,14 @@ private fun PlayerChrome(
             )
         }
 
-        if (showUI && !menuOpen && autoNextLeft == null) {
+        if (showUI && !menuOpen && autoNextLeft == null && switching == null) {
             PlayerTopBar(
                 onExit = onExit,
                 title = title,
                 episodeLabel = episodeLabel,
                 serverLabel = serverLabel,
                 modifier = Modifier.align(Alignment.TopCenter)
-                    .onFocusEvent { trackControlFocus(it.isFocused) },
+                    .onFocusEvent { trackControlFocus(it.hasFocus) },
             )
             PlayerCenterControls(
                 isPlaying = isPlaying,
@@ -1063,7 +1578,7 @@ private fun PlayerChrome(
                 onSeekBy = onSeekBy,
                 playFocus = playFocus,
                 modifier = Modifier.align(Alignment.Center)
-                    .onFocusEvent { trackControlFocus(it.isFocused) },
+                    .onFocusEvent { trackControlFocus(it.hasFocus) },
             )
             PlayerBottomControls(
                 positionMs = positionMs,
@@ -1071,18 +1586,21 @@ private fun PlayerChrome(
                 bufferedMs = bufferedMs,
                 skips = skips,
                 speed = speed,
-                serverLabel = serverLabel,
-                hasStreams = streams.isNotEmpty(),
-                resizeMode = resizeMode,
+                qualityLabel = currentQuality,
+                hasQualities = choices.size >= 2,
                 hasNext = hasNext,
-                showNext = showNext,
+                hasPrev = hasPrev,
                 onPlayPause = onPlayPause,
                 onOpenMenu = { tab -> if (tab >= 0) onMenuTab(tab); onMenuOpenChange(true) },
+                resizeLabel = resizeLabel(resizeMode),
                 onResizeToggle = onResizeToggle,
+                statsOpen = statsOpen,
+                onToggleStats = onToggleStats,
                 onNext = onNext,
+                onPrev = onPrev,
                 onScrubberFocus = onScrubberFocus,
                 modifier = Modifier.align(Alignment.BottomCenter)
-                    .onFocusEvent { trackControlFocus(it.isFocused) },
+                    .onFocusEvent { trackControlFocus(it.hasFocus) },
             )
         }
 
@@ -1093,6 +1611,9 @@ private fun PlayerChrome(
                 tab = menuTab,
                 onTab = onMenuTab,
                 onServer = onServerSelect,
+                choices = choices,
+                playingLink = currentEpLink,
+                onQualityLink = onQualityLink,
                 player = player,
                 trackSelector = trackSelector,
                 onSpeed = onSpeedChange,
@@ -1103,6 +1624,8 @@ private fun PlayerChrome(
                 onResize = onResizeToggle,
                 onNext = onNext,
                 hasNext = hasNext,
+                onPrev = onPrev,
+                hasPrev = hasPrev,
                 onSubAdded = onSubAdded,
                 onClose = { onMenuOpenChange(false) },
                 onExit = onExit,
@@ -1116,6 +1639,33 @@ private fun PlayerChrome(
             SeekOsdBadge(osd = osd, modifier = Modifier.align(Alignment.Center).padding(top = 40.dp))
         }
     }
+}
+
+/**
+ * "Skip intro" chip. Unlike the rest of the chrome it stays on screen while
+ * the controls are hidden, so it polls its own position once a second instead
+ * of riding the chrome clock — recomposition is confined to this chip.
+ */
+@Composable
+private fun SkipChip(
+    player: ExoPlayer,
+    skips: List<Skip>,
+    showUI: Boolean,
+    onTouch: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    var posMs by remember { mutableLongStateOf(0L) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            posMs = player.currentPosition.coerceAtLeast(0L)
+            delay(1000)
+        }
+    }
+    val active = skips.firstOrNull { posMs >= it.fromMs && posMs < it.toMs } ?: return
+    Button(
+        onClick = { player.seekTo(active.toMs); onTouch() },
+        modifier = modifier.padding(end = 28.dp, bottom = if (showUI) 150.dp else 28.dp),
+    ) { Text("Skip ${active.title.ifBlank { "Intro" }}".trim()) }
 }
 
 /** Top row: exit, what is playing, and which server is carrying it. */
@@ -1222,15 +1772,18 @@ private fun PlayerBottomControls(
     bufferedMs: Long,
     skips: List<Skip>,
     speed: Float,
-    serverLabel: String,
-    hasStreams: Boolean,
-    resizeMode: Int,
+    qualityLabel: String,
+    hasQualities: Boolean,
     hasNext: Boolean,
-    showNext: Boolean,
+    hasPrev: Boolean,
     onPlayPause: () -> Unit,
     onOpenMenu: (Int) -> Unit,
+    resizeLabel: String,
     onResizeToggle: () -> Unit,
+    statsOpen: Boolean,
+    onToggleStats: () -> Unit,
     onNext: () -> Unit,
+    onPrev: () -> Unit,
     onScrubberFocus: (Boolean) -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -1244,54 +1797,94 @@ private fun PlayerBottomControls(
             onTogglePlay = onPlayPause,
         )
         Spacer(Modifier.height(14.dp))
+        // Two fixed points: Prev/Next stay on the right, the rest scrolls left
+        // to right under the remote. A plain Row overflowed once the quality
+        // chip carried the full provider card title.
         Row(
             Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            PlayerActionButton(
-                icon = Icons.Filled.Audiotrack,
-                label = "Audio",
-                onClick = { onOpenMenu(1) },
-            )
-            PlayerActionButton(
-                icon = Icons.Filled.Subtitles,
-                label = "Subs",
-                onClick = { onOpenMenu(2) },
-            )
-            PlayerActionButton(
-                icon = Icons.Filled.Speed,
-                label = formatSpeed(speed),
-                onClick = { onOpenMenu(3) },
-            )
-            if (hasStreams) {
-                PlayerActionButton(
-                    icon = Icons.Filled.HighQuality,
-                    label = serverLabel,
-                    onClick = { onOpenMenu(0) },
-                )
+            LazyRow(
+                Modifier.weight(1f),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                item(key = "audio") {
+                    PlayerActionButton(
+                        icon = Icons.Filled.Audiotrack,
+                        label = "Audio",
+                        onClick = { onOpenMenu(2) },
+                    )
+                }
+                item(key = "subs") {
+                    PlayerActionButton(
+                        icon = Icons.Filled.Subtitles,
+                        label = "Subs",
+                        onClick = { onOpenMenu(3) },
+                    )
+                }
+                item(key = "speed") {
+                    PlayerActionButton(
+                        icon = Icons.Filled.Speed,
+                        label = formatSpeed(speed),
+                        onClick = { onOpenMenu(4) },
+                    )
+                }
+                if (hasQualities) {
+                    item(key = "quality") {
+                        PlayerActionButton(
+                            icon = Icons.Filled.HighQuality,
+                            // The provider's whole card name, size included
+                            // ("4K HDR REMUX HEVC H265 IMAX 80.2GB"): the chip
+                            // grows instead of reducing it to "2160p".
+                            label = qualityLabel,
+                            onClick = { onOpenMenu(1) },
+                            modifier = Modifier.widthIn(max = 480.dp),
+                        )
+                    }
+                }
+                item(key = "server") {
+                    PlayerActionButton(
+                        icon = Icons.Filled.Storage,
+                        label = "Server",
+                        onClick = { onOpenMenu(0) },
+                    )
+                }
+                // The Video tab's own footer actions, where the Video chip
+                // used to sit: one press instead of menu → tab → action.
+                item(key = "resize") {
+                    PlayerActionButton(
+                        icon = Icons.Filled.AspectRatio,
+                        label = resizeLabel,
+                        onClick = onResizeToggle,
+                    )
+                }
+                item(key = "stats") {
+                    PlayerActionButton(
+                        icon = Icons.Filled.Info,
+                        label = if (statsOpen) "Stats ✓" else "Stats",
+                        onClick = onToggleStats,
+                    )
+                }
             }
-            PlayerActionButton(
-                icon = Icons.Filled.AspectRatio,
-                label = resizeLabel(resizeMode),
-                onClick = onResizeToggle,
-            )
-            PlayerActionButton(
-                icon = Icons.Filled.MoreVert,
-                label = "More",
-                // Opens the panel where it was last left rather than always
-                // dumping the viewer on the server list.
-                onClick = { onOpenMenu(-1) },
-            )
-            Spacer(Modifier.weight(1f))
-            if (showNext && hasNext) {
+            if (hasPrev) {
+                Button(
+                    onClick = onPrev,
+                    modifier = Modifier.padding(start = 8.dp),
+                ) {
+                    Icon(Icons.Filled.SkipPrevious, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("Previous")
+                }
+            }
+            if (hasNext) {
                 Button(
                     onClick = onNext,
                     modifier = Modifier.padding(start = 8.dp),
                 ) {
                     Icon(Icons.Filled.SkipNext, contentDescription = null, modifier = Modifier.size(18.dp))
                     Spacer(Modifier.width(6.dp))
-                    Text("Next episode")
+                    Text("Next")
                 }
             }
         }
@@ -1490,38 +2083,57 @@ private fun PlayerRoundButton(
 }
 
 /**
- * Buffering indicator.
- *
- * tv-material ships no progress indicator, and a Compose `CircularProgress-
- * Indicator` is a Material-widget dependency this app does not take. One
- * rotating arc, drawn on a 48dp canvas, is the whole thing — one layer, and it
- * costs nothing on a weak GPU.
+ * While the first server resolves, the player is a black screen and a
+ * spinner — never page skeletons: placeholder cards read as a broken screen
+ * when they appear where a video is about to start.
  */
 @Composable
-private fun BufferingSpinner(modifier: Modifier = Modifier) {
-    var angle by remember { mutableFloatStateOf(0f) }
-    LaunchedEffect(Unit) {
-        while (isActive) {
-            delay(16)
-            angle = (angle + 6f) % 360f
+private fun PlayerLoading(
+    title: String,
+    episode: String,
+    modifier: Modifier = Modifier,
+) {
+    Box(modifier.background(Color.Black)) {
+        // The viewer pressed Play on a title they recognise; showing that title
+        // (and the fact that a source is being resolved) is the difference
+        // between "the player opened" and "the app froze on black".
+        Column(
+            Modifier.align(Alignment.Center).padding(horizontal = 64.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            VegaSpinner()
+            if (title.isNotBlank()) {
+                Text(
+                    title,
+                    style = MaterialTheme.typography.titleLarge,
+                    color = Color.White,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(top = 20.dp),
+                )
+            }
+            if (episode.isNotBlank()) {
+                Text(
+                    episode,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Color(0xCCFFFFFF),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(top = 4.dp),
+                )
+            }
+            Text(
+                "Starting stream…",
+                style = MaterialTheme.typography.bodySmall,
+                color = Color(0x99FFFFFF),
+                modifier = Modifier.padding(top = 10.dp),
+            )
         }
-    }
-    Canvas(modifier.size(48.dp)) {
-        val stroke = 4.dp.toPx()
-        val inset = stroke / 2f
-        drawCircle(
-            color = Color.White.copy(alpha = 0.15f),
-            radius = (size.minDimension - stroke) / 2f,
-            style = Stroke(width = stroke),
-        )
-        drawArc(
-            color = VegaPrimary,
-            startAngle = angle,
-            sweepAngle = 90f,
-            useCenter = false,
-            topLeft = Offset(inset, inset),
-            size = Size(size.width - stroke, size.height - stroke),
-            style = Stroke(width = stroke, cap = StrokeCap.Round),
+        Text(
+            "BACK  Cancel",
+            style = MaterialTheme.typography.labelLarge,
+            color = Color(0xB3FFFFFF),
+            modifier = Modifier.align(Alignment.TopStart).padding(28.dp),
         )
     }
 }
@@ -1670,6 +2282,10 @@ private fun PlaybackError(
     onServer: () -> Unit,
     onClose: () -> Unit,
     modifier: Modifier = Modifier,
+    title: String = "Playback failed",
+    retryLabel: String = "Retry",
+    serverLabel: String = "Try another server",
+    closeLabel: String = "Back",
 ) {
     val focus = remember { FocusRequester() }
     LaunchedEffect(Unit) { runCatching { focus.requestFocus() } }
@@ -1681,7 +2297,7 @@ private fun PlaybackError(
             .padding(28.dp),
     ) {
         Text(
-            "Playback failed",
+            title,
             style = MaterialTheme.typography.headlineSmall,
             fontWeight = FontWeight.Bold,
             color = Color.White,
@@ -1695,15 +2311,15 @@ private fun PlaybackError(
             modifier = Modifier.padding(top = 8.dp),
         )
         Row(Modifier.padding(top = 20.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            Button(onClick = onRetry, modifier = Modifier.focusRequester(focus)) { Text("Retry") }
-            Button(onClick = onServer) { Text("Try another server") }
-            Button(onClick = onClose) { Text("Back") }
+            Button(onClick = onRetry, modifier = Modifier.focusRequester(focus)) { Text(retryLabel) }
+            Button(onClick = onServer) { Text(serverLabel) }
+            Button(onClick = onClose) { Text(closeLabel) }
         }
     }
 }
 
 /**
- * MENU panel: servers, audio, subtitles, speed, video track, online subtitle
+ * MENU panel: servers, quality cards, audio, subtitles (plus online search), speed
  * search — the long tail of what a stream offers, kept off the bottom bar so
  * the frequently used controls stay one press away.
  */
@@ -1714,6 +2330,9 @@ private fun MenuPanel(
     tab: Int,
     onTab: (Int) -> Unit,
     onServer: (Int) -> Unit,
+    choices: List<QualityChoice>,
+    playingLink: String,
+    onQualityLink: (String) -> Unit,
     player: ExoPlayer,
     trackSelector: DefaultTrackSelector,
     onSpeed: (Float) -> Unit,
@@ -1724,13 +2343,18 @@ private fun MenuPanel(
     onResize: () -> Unit,
     onNext: () -> Unit,
     hasNext: Boolean,
+    onPrev: () -> Unit,
+    hasPrev: Boolean,
     onSubAdded: () -> Unit,
     onClose: () -> Unit,
     onExit: () -> Unit,
     firstTabFocus: FocusRequester,
     modifier: Modifier = Modifier,
 ) {
-    val tabs = listOf("Server", "Audio", "Subs", "Speed", "Video", "Find")
+    // Find was a second, weaker episode picker; the bar now carries the panel's
+    // own Video actions (Resize/Stats) instead of a tab-opening chip, so both
+    // tabs are gone.
+    val tabs = listOf("Server", "Quality", "Audio", "Subs", "Speed")
     // The panel replaced the control bar, so focus left the screen with it.
     // Start it back on the first tab rather than leaving the remote with
     // nothing to point at.
@@ -1742,13 +2366,27 @@ private fun MenuPanel(
             .background(ScrimHeavy)
             .padding(18.dp),
     ) {
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
             tabs.forEachIndexed { i, t ->
+                // Equal widths rather than intrinsic ones: five labels at their
+                // natural width overflow the panel and squeeze the last one —
+                // "Speed" — into a column of single characters.
                 Button(
                     onClick = { onTab(i) },
-                    modifier = if (i == 0) Modifier.focusRequester(firstTabFocus) else Modifier,
+                    modifier = Modifier.weight(1f).then(
+                        if (i == 0) Modifier.focusRequester(firstTabFocus) else Modifier,
+                    ),
+                    contentPadding = PaddingValues(horizontal = 6.dp, vertical = 8.dp),
                 ) {
-                    Text((if (i == tab) "• " else "") + t)
+                    Text(
+                        (if (i == tab) "• " else "") + t,
+                        maxLines = 1,
+                        softWrap = false,
+                        overflow = TextOverflow.Ellipsis,
+                    )
                 }
             }
         }
@@ -1769,17 +2407,51 @@ private fun MenuPanel(
                     }
                 }
             }
-            1 -> AudioList(player, trackSelector)
-            2 -> SubList(player, trackSelector, onSubAdded)
-            3 -> SpeedAndFps(speed = speed, onSpeed = onSpeed)
-            4 -> VideoList(player, trackSelector)
-            5 -> SubFind(onSubAdded = onSubAdded)
+            1 -> {
+                // Quality dropdown: the same shape as the server list, but the
+                // entries are only the renditions the provider actually named
+                // (plus "Auto" when it named nothing) — no server or title.
+                // A movie's quality cards are separate links, so selecting one
+                // swaps the source link instead of an in-stream rendition.
+                val playing = (streams.getOrNull(selected)?.quality ?: "")
+                    .trim().ifBlank { "Auto" }.lowercase()
+                LazyColumn(Modifier.height(280.dp)) {
+                    itemsIndexed(choices, key = { i, _ -> "q-$i" }) { _, choice ->
+                        val active = if (choice.streamIndex >= 0) {
+                            choice.label.lowercase() == playing
+                        } else {
+                            choice.link == playingLink
+                        }
+                        Button(
+                            onClick = {
+                                if (choice.streamIndex >= 0) onServer(choice.streamIndex)
+                                else onQualityLink(choice.link)
+                            },
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
+                        ) {
+                            Text(
+                                (if (active) "✓ " else "") + choice.label,
+                                // A provider card title carries the whole
+                                // rendition ("4K HDR REMUX HEVC H265 IMAX
+                                // 80.2GB"); two lines show it without
+                                // truncating the size away.
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                    }
+                }
+            }
+            2 -> AudioList(player, trackSelector)
+            3 -> SubList(player, trackSelector, onSubAdded)
+            4 -> SpeedAndFps(speed = speed, onSpeed = onSpeed)
         }
         Row(
             Modifier.fillMaxWidth().padding(top = 14.dp),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             Button(onClick = onResize) { Text("Resize: ${resizeLabel(resizeMode)}") }
+            if (hasPrev) Button(onClick = onPrev) { Text("Prev") }
             if (hasNext) Button(onClick = onNext) { Text("Next") }
             Button(onClick = onToggleStats) { Text(if (statsOpen) "Stats ✓" else "Stats") }
             Button(onClick = onClose) { Text("Close") }
@@ -1866,44 +2538,6 @@ private fun AudioList(player: ExoPlayer, trackSelector: DefaultTrackSelector) {
     }
 }
 
-/** Alternate video tracks (renditions), when the source really has several. */
-@Composable
-private fun VideoList(player: ExoPlayer, trackSelector: DefaultTrackSelector) {
-    val groups = remember(player.currentTracks) {
-        player.currentTracks.groups.filter { it.type == C.TRACK_TYPE_VIDEO }
-    }
-    if (groups.isEmpty()) {
-        Text(
-            "No alternate video tracks",
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.padding(top = 12.dp),
-        )
-        return
-    }
-    groups.forEach { g ->
-        for (i in 0 until g.length) {
-            val f = g.getTrackFormat(i)
-            val label = buildString {
-                if (g.isSelected) append("✓ ")
-                append(
-                    if (f.height > 0) "${f.height}p" else f.label ?: "Track ${i + 1}",
-                )
-                if (f.bitrate > 0) append(" · ${f.bitrate / 1000} kbps")
-            }
-            Row(Modifier.fillMaxWidth().padding(top = 6.dp)) {
-                Button(
-                    onClick = {
-                        trackSelector.buildUponParameters()
-                            .setOverrideForType(TrackSelectionOverride(g.mediaTrackGroup, i))
-                            .build().let { trackSelector.parameters = it }
-                    },
-                    modifier = Modifier.fillMaxWidth(),
-                ) { Text(label, maxLines = 1, overflow = TextOverflow.Ellipsis) }
-            }
-        }
-    }
-}
-
 /** Embedded + external subtitle tracks, plus off, plus file delay. */
 @Composable
 private fun SubList(
@@ -1915,10 +2549,22 @@ private fun SubList(
     // recomposing this composable when only the shared counter changed.
     var delayMs by remember { mutableLongStateOf(PlaybackSession.subDelayMs) }
     var delayNote by remember { mutableStateOf<String?>(null) }
+    // The Find tab is gone from the bar; searching/importing an online
+    // subtitle still belongs next to the track list it feeds.
+    var finding by remember { mutableStateOf(false) }
     fun shift(delta: Long) {
         val ok = applySubDelay(delta) { onSubAdded() }
         delayMs = PlaybackSession.subDelayMs
         delayNote = if (ok) null else "This subtitle format can't shift"
+    }
+    if (finding) {
+        Column {
+            SubFind(onSubAdded = onSubAdded)
+            Button(onClick = { finding = false }, modifier = Modifier.padding(top = 10.dp)) {
+                Text("Back to tracks")
+            }
+        }
+        return
     }
     Column {
         Button(
@@ -1980,6 +2626,10 @@ private fun SubList(
                 }
             }
         }
+        Button(
+            onClick = { finding = true },
+            modifier = Modifier.padding(top = 10.dp),
+        ) { Text("Add subtitle…") }
     }
 }
 
@@ -2105,11 +2755,63 @@ private fun streamLabel(sel: VegaStream) = buildString {
     if (q.isNotBlank()) append(" · $q")
 }
 
+/**
+ * One entry of the Quality tab: either an in-stream rendition ([streamIndex])
+ * or a whole alternate link from the provider's movie quality cards ([link]).
+ */
+private data class QualityChoice(
+    val label: String,
+    val streamIndex: Int = -1,
+    val link: String = "",
+)
+
+/**
+ * The player's quality list.
+ *
+ * A movie's provider hands over named quality cards ("4K HDR REMUX HEVC H265
+ * IMAX 80.2GB"). Those are the renditions the viewer picked between on the
+ * detail page, so they *are* the list — the streams behind any one of them
+ * carry a resolution label ("2160p") that would replace the richer card title
+ * and pretend the other cards do not exist. Best resolution, then largest file,
+ * comes first. Shows have no alternates and keep their stream qualities.
+ */
+private fun qualityChoices(streams: List<VegaStream>): List<QualityChoice> {
+    val alternates = PlaybackSession.qualityAlternates
+    if (alternates.isNotEmpty()) {
+        return alternates
+            .distinctBy { it.link }
+            .sortedByDescending { qualityScore(it.label) }
+            .map { QualityChoice(it.label, link = it.link) }
+    }
+    return qualityOptions(streams).map { (label, i) ->
+        QualityChoice(label, streamIndex = i)
+    }
+}
+
+/**
+ * Distinct quality labels the provider named, best first, each mapped to the
+ * index of the best stream carrying it. Labels are deduplicated
+ * case-insensitively; streams whose quality is blank collapse into one "Auto"
+ * entry that points at the best-ranked of them.
+ */
+private fun qualityOptions(streams: List<VegaStream>): List<Pair<String, Int>> {
+    val best = LinkedHashMap<String, Int>()
+    streams.forEachIndexed { i, s ->
+        val key = s.quality?.trim().orEmpty().lowercase()
+        val cur = best[key]
+        if (cur == null || streamHeight(s) >= streamHeight(streams[cur])) best[key] = i
+    }
+    return best.values
+        .sortedByDescending { streamHeight(streams[it]) }
+        .map { i -> streams[i].quality?.trim().orEmpty().ifBlank { "Auto" } to i }
+}
+
 /** "Episode 4" / "Episode 4 · The Heist" — never a provider file name. */
 private fun episodeSubtitle(ep: tv.vega.tv.data.model.EpisodeItem): String {
     val label = tv.vega.tv.ui.common.episodeLabel(ep)
     if (label.startsWith("Episode")) return label
-    return if (ep.number > 0) "Episode ${ep.number} · $label" else label
+    val num = tv.vega.tv.ui.common.episodeNumber(ep)
+    return if (num.isNotBlank()) "Episode $num · $label" else label
 }
 
 private fun collectSkips(sel: VegaStream): List<Skip> {
@@ -2271,22 +2973,72 @@ private fun shiftSubtitleTimes(text: String, deltaMs: Long): String =
         }
     }
 
-private suspend fun saveProgress(pos: Long, dur: Long) {
+/**
+ * Preferred-audio language codes. Both the 2-letter and 3-letter form are
+ * supplied because providers label tracks inconsistently ("hi" vs "hin").
+ * Media3 normalises them and falls back to the source's default if neither
+ * exists.
+ */
+private fun preferredAudioCodes(value: String): Array<String> = when (value.lowercase()) {
+    "hi", "hin", "hindi" -> arrayOf("hi", "hin")
+    "en", "eng", "english" -> arrayOf("en", "eng")
+    else -> emptyArray()
+}
+
+/**
+ * Matches both real language tags and the label providers actually ship.
+ * ExoPlayer leaves [Format.language] null/und when the container does not
+ * declare it, even though the label says "Hindi" or "हिंदी".
+ */
+private fun audioTrackMatches(format: Format, preference: String): Boolean {
+    val want = preference.lowercase()
+    val hindi = want == "hi" || want == "hin" || want == "hindi"
+    val english = want == "en" || want == "eng" || want == "english"
+    if (!hindi && !english) return false
+    val lang = format.language?.trim()?.lowercase().orEmpty()
+    val label = format.label?.trim()?.lowercase().orEmpty()
+    val labelMatch = if (hindi) {
+        label.contains("hindi") || label.contains("हिंदी") || label.contains("हिन्दी")
+    } else {
+        label.contains("english") || label.contains("अंग्रेज़ी") || label.contains("अंग्रेजी")
+    }
+    if (labelMatch) return true
+    return if (hindi) {
+        lang == "hi" || lang == "hin" || lang.startsWith("hi-") || lang.startsWith("hi_")
+    } else {
+        lang == "en" || lang == "eng" || lang.startsWith("en-") || lang.startsWith("en_")
+    }
+}
+
+private suspend fun saveProgress(pos: Long, dur: Long, sync: Boolean = false) {
     runCatching {
         val ep = PlaybackSession.episodes.getOrNull(PlaybackSession.startIndex)
+        // Save the link playback actually used, not the post/detail page that
+        // opened the title. Continue Watching calls getStream directly with
+        // this value; the post link is only an input to getMeta. Storing the
+        // post link here was why resuming failed with "Blocked private host"
+        // while the same title played from its feed.
+        val playable = ep?.link?.takeIf { it.isNotBlank() }
+            ?: PlaybackSession.pendingLink
         ServiceLocator.history.upsert(
             WatchEntry(
-                mediaId = (ep?.link ?: PlaybackSession.pendingLink).ifBlank { return },
+                mediaId = playable.ifBlank { return },
                 title = PlaybackSession.title.ifBlank { PlaybackSession.pendingTitle },
-                episodeTitle = ep?.title.orEmpty(),
+                episodeTitle = ep?.title ?: PlaybackSession.pendingEpisodeTitle,
                 posterUrl = PlaybackSession.posterUrl.ifBlank { PlaybackSession.pendingPoster },
                 positionMs = pos, durationMs = dur, updatedAt = System.currentTimeMillis(),
-                link = PlaybackSession.pendingLink,
+                link = playable,
                 provider = ServiceLocator.providers.active()?.ext?.value.orEmpty(),
                 episodeIndex = PlaybackSession.startIndex,
+                mediaType = PlaybackSession.info?.type
+                    ?.takeIf { it.isNotBlank() }
+                    ?: PlaybackSession.pendingType,
             ),
         )
-        ServiceLocator.syncSoon()
+        // A periodic checkpoint is a local DataStore write only. Publishing a
+        // sync manifest every five seconds made file I/O and shared-folder work
+        // compete with the decoder; publish once, when playback ends.
+        if (sync) ServiceLocator.syncSoon()
     }
 }
 
@@ -2294,7 +3046,7 @@ private fun saveProgressSync(pos: Long, dur: Long) {
     // Fire-and-forget from onDispose (no scope): use a daemon thread.
     Thread {
         runCatching {
-            kotlinx.coroutines.runBlocking { saveProgress(pos, dur) }
+            kotlinx.coroutines.runBlocking { saveProgress(pos, dur, sync = true) }
         }
     }.apply { isDaemon = true }.start()
 }

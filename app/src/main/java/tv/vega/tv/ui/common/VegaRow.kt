@@ -2,6 +2,7 @@ package tv.vega.tv.ui.common
 
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -70,7 +71,8 @@ fun VegaRow(
             )
             else -> LazyRow(
                 horizontalArrangement = Arrangement.spacedBy(14.dp),
-                modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
+                contentPadding = PaddingValues(vertical = 10.dp),
+                modifier = Modifier.fillMaxWidth(),
             ) {
                 // Leading spacer is keyed inside the row's own range: an
                 // unkeyed `item {}` alongside a keyed `items` makes Lazy throw on

@@ -13,6 +13,8 @@ import tv.vega.tv.data.sync.SyncService
 import tv.vega.tv.data.watchlist.WatchlistStore
 
 object ServiceLocator {
+    lateinit var appContext: Context
+        private set
     lateinit var repository: VegaRepository
         private set
     lateinit var history: WatchHistoryStore
@@ -29,6 +31,7 @@ object ServiceLocator {
     fun init(context: Context) {
         if (::repository.isInitialized) return
         val app = context.applicationContext
+        appContext = app
         history = WatchHistoryStore(app)
         settings = AppSettings(app)
         providers = ProviderManager(app)
@@ -44,9 +47,10 @@ object ServiceLocator {
                     if (local == null || r.updatedAt > local.updatedAt) history.upsert(r)
                 }
             }
+            s.deleteHistory = { mediaId, link -> history.remove(mediaId, link) }
             s.applyWatchlist = { watchlist.replaceAll(it) }
         }
-        repository = VegaRepository(app, providers)
+        repository = VegaRepository(app, providers, settings)
     }
 
     /** Fire-and-forget sync triggers (Home focus, post-playback, edits). */

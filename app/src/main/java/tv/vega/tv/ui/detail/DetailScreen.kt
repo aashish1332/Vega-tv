@@ -4,6 +4,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
@@ -46,11 +47,13 @@ import kotlinx.coroutines.launch
 import tv.vega.tv.data.ServiceLocator
 import tv.vega.tv.data.model.EpisodeItem
 import tv.vega.tv.player.PlaybackSession
+import tv.vega.tv.player.qualityLinksOf
+import tv.vega.tv.player.qualityScore
 import tv.vega.tv.ui.common.EmptyState
 import tv.vega.tv.ui.common.EpisodeCard
 import tv.vega.tv.ui.common.ErrorScreen
-import tv.vega.tv.ui.common.LoadingScreen
 import tv.vega.tv.ui.common.UiState
+import tv.vega.tv.ui.common.VegaSpinner
 import tv.vega.tv.ui.common.WafError
 import tv.vega.tv.ui.common.VegaChip
 import tv.vega.tv.ui.theme.ScrimHeavy
@@ -77,7 +80,33 @@ fun DetailScreen(
     val playFocus = remember { FocusRequester() }
 
     when (val s = state) {
-        is UiState.Loading -> LoadingScreen(Modifier.fillMaxSize())
+        is UiState.Loading -> {
+            // The poster the viewer just tapped is already in hand: show it
+            // as the backdrop and spin — page skeletons would be a step
+            // backwards from the context they arrived with.
+            val ctx = LocalContext.current
+            Box(
+                Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background),
+                contentAlignment = Alignment.Center,
+            ) {
+                val poster = PlaybackSession.pendingPoster
+                if (poster.isNotBlank()) {
+                    AsyncImage(
+                        model = ImageRequest.Builder(ctx).data(poster)
+                            .size(1280, 720).allowHardware(true).build(),
+                        contentDescription = null,
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                    Box(
+                        Modifier.fillMaxSize().background(
+                            Brush.verticalGradient(0.35f to Color.Transparent, 1f to ScrimHeavy),
+                        ),
+                    )
+                }
+                VegaSpinner()
+            }
+        }
         is UiState.Error -> {
             WafError(
                 message = s.message,
@@ -89,13 +118,34 @@ fun DetailScreen(
         }
         is UiState.Success -> {
             val info = s.data.info
+            val groups = s.data.seasonGroups
+            // "S1" is the default, not just the first tab a provider happened to
+            // list: some sources put Specials (S0) first. A single visible group
+            // needs no selector at all (movies and one-season shows).
+            val defaultGroupKey = remember(groups) {
+                groups.firstOrNull { it.number == 1 }?.key ?: groups.firstOrNull()?.key
+            }
+            var selectedGroupKey by remember(info.linkList) {
+                mutableStateOf<String?>(defaultGroupKey)
+            }
+            val activeGroupKey = selectedGroupKey
+                ?.takeIf { key -> groups.any { it.key == key } }
+                ?: defaultGroupKey
+            val activeSeasons = if (groups.size > 1) {
+                s.data.seasons.filter { it.seasonKey == activeGroupKey }
+            } else {
+                s.data.seasons
+            }
             LaunchedEffect(info.linkList) {
                 inLibrary = runCatching {
                     ServiceLocator.watchlist.isIn(PlaybackSession.pendingLink)
                 }.getOrDefault(false)
                 runCatching { playFocus.requestFocus() }
             }
-            LazyColumn(Modifier.fillMaxSize().padding(32.dp)) {
+            LazyColumn(
+                Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(horizontal = 24.dp, vertical = 16.dp),
+            ) {
                 item(key = "overview") {
                     val ctx = LocalContext.current
                     Box(
@@ -156,18 +206,22 @@ fun DetailScreen(
                                 // season 1 is specials or behind a fetch that
                                 // has not come back yet must not send the user
                                 // into an empty episode list.
-                                val ready = s.data.seasons.firstOrNull { it.episodes.isNotEmpty() }
-                                    ?: s.data.seasons.firstOrNull()
+                                val ready = activeSeasons.firstOrNull { it.episodes.isNotEmpty() }
+                                    ?: activeSeasons.firstOrNull()
                                 val eps = ready?.episodes ?: emptyList()
                                 PlaybackSession.set(
                                     info.title.ifBlank { PlaybackSession.pendingTitle },
                                     info.image.ifBlank { PlaybackSession.pendingPoster },
-                                    eps, 0, info,
+                                    eps, 0, info, qualityLinksOf(info),
                                 )
+                                // Any season still resolving stops here; its
+                                // provider calls must not share the network
+                                // with the video about to start.
+                                vm.cancelPending()
                                 onPlay()
                             },
                             modifier = Modifier.focusRequester(playFocus),
-                            enabled = s.data.seasons.any { it.episodes.isNotEmpty() },
+                            enabled = activeSeasons.any { it.episodes.isNotEmpty() },
                         ) { Text("Play") }
                         Button(onClick = { expanded = !expanded }) {
                             Text(if (expanded) "Show less" else "Read more")
@@ -195,6 +249,32 @@ fun DetailScreen(
                     }
                     Spacer(Modifier.height(16.dp))
                 }
+                if (groups.size > 1) {
+                    item(key = "season-picker") {
+                        Column(Modifier.fillMaxWidth().padding(bottom = 4.dp)) {
+                            Text(
+                                "Seasons",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(bottom = 6.dp),
+                            )
+                            LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                itemsIndexed(
+                                    groups,
+                                    key = { _, group -> group.key },
+                                    contentType = { _, _ -> "season-tab" },
+                                ) { _, group ->
+                                    Button(onClick = { selectedGroupKey = group.key }) {
+                                        Text(
+                                            (if (group.key == activeGroupKey) "✓ " else "") + group.label,
+                                            maxLines = 1,
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 if (s.data.seasons.isEmpty()) {
                     item(key = "no-seasons") {
                         // Focusable, unlike a bare Text: with no episode to
@@ -207,14 +287,22 @@ fun DetailScreen(
                         )
                     }
                 } else {
-                    s.data.seasons.forEachIndexed { si, season ->
-                        item(key = "season-$si") {
+                    activeSeasons.forEachIndexed { si, season ->
+                        item(key = "season-${season.seasonKey}-$si") {
                             SeasonBlock(
                                 season = season,
                                 infoTitle = info.title.ifBlank { PlaybackSession.pendingTitle },
                                 infoPoster = info.image.ifBlank { PlaybackSession.pendingPoster },
                                 info = info,
-                                onPlay = onPlay,
+                                // A movie's cards are renditions, already
+                                // ordered best-first by the view model; the
+                                // Asc/Desc toggle for episodes would make the
+                                // Play button start a lower quality copy.
+                                qualityCards = tv.vega.tv.player.isMovieInfo(info),
+                                onPlay = {
+                                    vm.cancelPending()
+                                    onPlay()
+                                },
                             )
                         }
                     }
@@ -230,15 +318,17 @@ private fun SeasonBlock(
     infoTitle: String,
     infoPoster: String,
     info: tv.vega.tv.data.model.VegaInfo,
+    qualityCards: Boolean,
     onPlay: () -> Unit,
 ) {
     var desc by remember { mutableStateOf(false) }
     var finding by remember { mutableStateOf(false) }
     var query by remember { mutableStateOf("") }
-    val eps = remember(season.episodes, desc, query) {
+    val eps = remember(season.episodes, desc, query, qualityCards) {
         var list = season.episodes
         if (query.isNotBlank()) list = list.filter { it.title.contains(query, true) }
-        if (desc) list.reversed() else list
+        if (qualityCards) list.sortedByDescending { qualityScore(it.title) }
+        else if (desc) list.reversed() else list
     }
     Column(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -249,8 +339,10 @@ private fun SeasonBlock(
                 modifier = Modifier.weight(1f).padding(vertical = 8.dp),
             )
             if (season.episodes.isNotEmpty()) {
-                Button(onClick = { desc = !desc }) { Text(if (desc) "Desc" else "Asc") }
-                Spacer(Modifier.width(8.dp))
+                if (!qualityCards) {
+                    Button(onClick = { desc = !desc }) { Text(if (desc) "Desc" else "Asc") }
+                    Spacer(Modifier.width(8.dp))
+                }
                 Button(onClick = { finding = !finding }) { Text("Find") }
             }
         }
@@ -264,11 +356,29 @@ private fun SeasonBlock(
             )
         }
         if (eps.isEmpty()) {
-            Text(
-                if (season.episodes.isEmpty()) "No episodes" else "No episodes match \"$query\"",
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(vertical = 8.dp),
-            )
+            if (season.pending) {
+                // The season header is published before its episode fetch
+                // finishes. "No episodes" here looked like a broken empty row
+                // and then popped into cards; a quiet spinner communicates the
+                // same wait without a skeleton flash.
+                Row(
+                    Modifier.padding(vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    VegaSpinner(diameter = 20.dp)
+                    Spacer(Modifier.width(10.dp))
+                    Text(
+                        "Loading episodes…",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            } else {
+                Text(
+                    if (season.episodes.isEmpty()) "No episodes" else "No episodes match \"$query\"",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(vertical = 8.dp),
+                )
+            }
         } else {
             LazyRow(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 itemsIndexed(
@@ -286,9 +396,12 @@ private fun SeasonBlock(
                     EpisodeCard(
                         episode = ep,
                         onClick = {
-                            PlaybackSession.set(infoTitle, infoPoster, eps, idx, info)
+                            PlaybackSession.set(
+                                infoTitle, infoPoster, eps, idx, info, qualityLinksOf(info),
+                            )
                             onPlay()
                         },
+                        qualityCard = qualityCards,
                     )
                 }
             }

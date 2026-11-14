@@ -17,11 +17,19 @@ class SearchViewModel : ViewModel() {
     val state: StateFlow<UiState<List<VegaPost>>> = _state
     private val _wafUrl = MutableStateFlow<String?>(null)
     val wafUrl: StateFlow<String?> = _wafUrl
+
+    /** The query the current [state] belongs to (not what is in the field now). */
+    private val _searchedQuery = MutableStateFlow("")
+    val searchedQuery: StateFlow<String> = _searchedQuery
+
     private var job: Job? = null
 
     fun search(query: String) {
         val q = query.trim()
+        // Keep the last results visible for a too-short query instead of
+        // claiming "no results for" it.
         if (q.length < 2) return
+        _searchedQuery.value = q
         job?.cancel()
         job = viewModelScope.launch {
             _state.value = UiState.Loading

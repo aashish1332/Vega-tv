@@ -3,6 +3,10 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Self-update: the app downloads its own release APK and opens the
+         system installer. The OS still confirms every install. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <!-- Android TV: touchscreen not required, leanback shown on home -->
     <uses-feature
@@ -15,9 +19,11 @@
     <application
         android:name=".App"
         android:allowBackup="true"
-        android:banner="@drawable/app_banner"
-        android:icon="@drawable/ic_launcher"
+        android:banner="@drawable/vega_banner"
+        android:icon="@drawable/vega_icon"
+        android:roundIcon="@drawable/vega_icon"
         android:label="@string/app_name"
+        android:resizeableActivity="true"
         android:supportsRtl="true"
         android:theme="@style/Theme.VegaTV"
         android:usesCleartextTraffic="true"
@@ -38,5 +44,18 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- The installer reads the downloaded APK through this provider:
+             a content:// URI is the only way to hand out a file from cache
+             that the package manager will accept on modern Android. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
     </application>
 </manifest>

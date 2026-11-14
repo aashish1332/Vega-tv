@@ -26,6 +26,8 @@ class ExtensionStore(private val context: Context) {
     private val manifestPrefix = "manifest_"
     private val manifestTimePrefix = "manifest_time_"
     private val modulesIndexKey = stringPreferencesKey("modules_index_json")
+    private val updateCheckKey = longPreferencesKey("provider_update_check")
+    private val updateRetryKey = longPreferencesKey("provider_update_retry_at")
 
     // -- sources --
     suspend fun sources(): List<ProviderSource> =
@@ -86,8 +88,17 @@ class ExtensionStore(private val context: Context) {
         val cur = installed().toMutableList()
         val i = cur.indexOfFirst { it.value == ext.value && it.source.author == ext.source.author }
         val now = System.currentTimeMillis()
-        if (i >= 0) cur[i] = cur[i].copy(version = ext.version, lastUpdated = now)
-        else cur.add(ext.copy(installed = true, installedAt = now, lastUpdated = now))
+        if (i >= 0) {
+            // Manifest updates can rename a provider or move its icon, and an
+            // automatic update must keep those in sync as well as the version.
+            cur[i] = ext.copy(
+                installed = true,
+                installedAt = cur[i].installedAt.takeIf { it > 0L } ?: now,
+                lastUpdated = now,
+            )
+        } else {
+            cur.add(ext.copy(installed = true, installedAt = now, lastUpdated = now))
+        }
         setInstalled(cur)
     }
 
@@ -115,6 +126,20 @@ class ExtensionStore(private val context: Context) {
     suspend fun manifestExpired(author: String): Boolean =
         context.extStore.data.map { it[longPreferencesKey(manifestTimePrefix + author)] ?: 0L }.first()
             .let { System.currentTimeMillis() - it > 24 * 60 * 60 * 1000L }
+
+    suspend fun lastUpdateCheck(): Long =
+        context.extStore.data.map { it[updateCheckKey] ?: 0L }.first()
+
+    suspend fun setLastUpdateCheck(at: Long) {
+        context.extStore.edit { it[updateCheckKey] = at }
+    }
+
+    suspend fun updateRetryAt(): Long =
+        context.extStore.data.map { it[updateRetryKey] ?: 0L }.first()
+
+    suspend fun setUpdateRetryAt(at: Long) {
+        context.extStore.edit { it[updateRetryKey] = at }
+    }
 
     // -- modules (index in DataStore, code in files) --
     suspend fun moduleIndex(): List<ProviderModules> =

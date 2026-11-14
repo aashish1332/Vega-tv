@@ -1,6 +1,38 @@
 package tv.vega.tv.data.model
 
+import kotlinx.serialization.KSerializer
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.descriptors.PrimitiveKind
+import kotlinx.serialization.descriptors.PrimitiveSerialDescriptor
+import kotlinx.serialization.descriptors.SerialDescriptor
+import kotlinx.serialization.encoding.Decoder
+import kotlinx.serialization.encoding.Encoder
+import kotlinx.serialization.json.JsonDecoder
+import kotlinx.serialization.json.JsonPrimitive
+
+/**
+ * Upstream `Post.aspectRatio?: number | string`. Several providers return
+ * `aspectRatio: 16 / 9` (a JSON number), which failed strict String decoding
+ * (`Expected quotation mark`). Accept both shapes and keep the numeric value
+ * as its literal text; [tv.vega.tv.ui.common.parseAspectRatio] parses either a
+ * "16:9"/"16/9" ratio or a bare float.
+ */
+object StringOrNumberSerializer : KSerializer<String> {
+    override val descriptor: SerialDescriptor =
+        PrimitiveSerialDescriptor("StringOrNumber", PrimitiveKind.STRING)
+
+    override fun serialize(encoder: Encoder, value: String) = encoder.encodeString(value)
+
+    override fun deserialize(decoder: Decoder): String {
+        val json = decoder as? JsonDecoder ?: return decoder.decodeString()
+        val el = json.decodeJsonElement()
+        return when {
+            el is kotlinx.serialization.json.JsonNull -> ""
+            el is JsonPrimitive -> el.content
+            else -> el.toString()
+        }
+    }
+}
 
 /**
  * Full parity with vega-app providers/types.ts. Field names match provider
@@ -12,6 +44,7 @@ data class VegaPost(
     val link: String = "",
     val image: String = "",
     val provider: String? = null,
+    @Serializable(with = StringOrNumberSerializer::class)
     val aspectRatio: String? = null,
     val borderRadius: Float? = null,
     val tag: String? = null,
@@ -97,6 +130,7 @@ data class VegaInfo(
     val webUrl: String? = null,
     val tags: List<String> = emptyList(),
     val cast: List<String> = emptyList(),
+    @Serializable(with = StringOrNumberSerializer::class)
     val rating: String? = null,
     val trailerUrl: String? = null,
     val linkList: List<SeasonEntry> = emptyList(),
@@ -120,4 +154,8 @@ data class HomeRow(
     val filter: String = "",
     val posts: List<VegaPost> = emptyList(),
     val error: String? = null,
+    // "author:value" of the provider this row came from. Blank when the home
+    // page shows a single provider; set while mixing so opening a post (or
+    // "See all") can first point the app's active provider at the origin.
+    val providerRef: String = "",
 )

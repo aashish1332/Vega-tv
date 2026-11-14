@@ -48,6 +48,21 @@ data class ProviderModules(
     val cachedAt: Long = 0L,
 )
 
+internal fun isNewerProviderVersion(candidate: String, current: String): Boolean {
+    fun parts(version: String): List<Int> = version.split('.').map { raw ->
+        raw.trim().takeWhile { it.isDigit() }.toIntOrNull() ?: 0
+    }
+    val newer = parts(candidate)
+    val installed = parts(current)
+    for (i in 0 until maxOf(newer.size, installed.size)) {
+        val n = newer.getOrElse(i) { 0 }
+        val c = installed.getOrElse(i) { 0 }
+        if (n > c) return true
+        if (n < c) return false
+    }
+    return false
+}
+
 /**
  * Port of web `createProviderSource` / `getProviderFilesUrl` /
  * `isValidProviderPath` (helpers.ts). Accepts a repo or raw URL on GitHub,

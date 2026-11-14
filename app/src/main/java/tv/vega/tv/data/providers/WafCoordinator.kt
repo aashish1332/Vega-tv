@@ -10,6 +10,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
@@ -35,6 +36,11 @@ data class WafChallenge(
     val waitForCookie: String?,
     /** When false the user may submit the page themselves without any cookie. */
     val waitForLoad: Boolean,
+    val headers: Map<String, String> = emptyMap(),
+    val injectedJavaScript: String? = null,
+    val timeoutMs: Long = 0L,
+    val title: String = "",
+    val description: String = "",
 )
 
 /**
@@ -83,11 +89,26 @@ object WafCoordinator {
         url: String,
         waitForCookie: String? = null,
         waitForLoad: Boolean = false,
+        headers: Map<String, String> = emptyMap(),
+        injectedJavaScript: String? = null,
+        timeoutMs: Long = 0L,
+        title: String = "",
+        description: String = "",
     ): WafResult {
         val id = nextId++
         val deferred = CompletableDeferred<WafResult>()
         synchronized(waiters) { waiters[id] = deferred }
-        _pending.value = WafChallenge(id, url, waitForCookie, waitForLoad)
+        _pending.value = WafChallenge(
+            id = id,
+            url = url,
+            waitForCookie = waitForCookie,
+            waitForLoad = waitForLoad,
+            headers = headers,
+            injectedJavaScript = injectedJavaScript,
+            timeoutMs = timeoutMs,
+            title = title,
+            description = description,
+        )
         return try {
             deferred.await()
         } finally {
@@ -116,10 +137,9 @@ object WafCoordinator {
      * until the read has completed: popping the screen earlier would destroy
      * the WebView this is about to read.
      */
-    fun deliverAndThen(id: Long, onDelivered: () -> Unit) {
+    fun deliverAndThen(id: Long, dataOverride: String? = null, onDelivered: () -> Unit) {
         scope.launch {
-            deliver(id)
-            onDelivered()
+            if (deliver(id, dataOverride)) onDelivered()
         }
     }
 
@@ -130,13 +150,13 @@ object WafCoordinator {
      * `evaluateJavascript`, whose callback is asynchronous — there is no
      * synchronous way to ask a WebView for its DOM.
      */
-    suspend fun deliver(id: Long) {
+    suspend fun deliver(id: Long, dataOverride: String? = null): Boolean {
         val webView = synchronized(waiters) { webViews[id] }
-        val deferred = synchronized(waiters) { waiters[id] } ?: return
-        val result = runCatching { snapshot(webView) }.getOrNull()
-        if (result != null) deferred.complete(result) else deferred.completeExceptionally(
-            IllegalStateException("Challenge page could not be read"),
-        )
+        val deferred = synchronized(waiters) { waiters[id] } ?: return false
+        val result = runCatching { snapshot(webView, dataOverride) }.getOrNull()
+        if (result != null) return deferred.complete(result)
+        deferred.completeExceptionally(IllegalStateException("Challenge page could not be read"))
+        return false
     }
 
     /** User closed the challenge without solving it. */
@@ -158,7 +178,10 @@ object WafCoordinator {
         _pending.value = null
     }
 
-    private suspend fun snapshot(webView: android.webkit.WebView?): WafResult? {
+    private suspend fun snapshot(
+        webView: android.webkit.WebView?,
+        dataOverride: String? = null,
+    ): WafResult? {
         if (webView == null) return null
         val url = webView.url.orEmpty()
         val cookieHeader = runCatching { CookieManager.getInstance().getCookie(url).orEmpty() }.getOrDefault("")
@@ -172,8 +195,12 @@ object WafCoordinator {
         val ua = runCatching { webView.settings.userAgentString }.getOrDefault("")
         // The provider asked for the page, not just proof that it loaded, so the
         // solved HTML is part of the answer — many providers re-parse it to pull
-        // a fresh token straight out of the document.
-        val data = readHtml(webView).orEmpty()
+        // a fresh token straight out of the document. A provider that posts a
+        // token through the ReactNativeWebView bridge gets that payload instead:
+        // some gates keep the token only in localStorage, never in the DOM.
+        // The view can be released while a read is in flight (BACK, challenge
+        // replacement). Bound the wait so the provider call still answers.
+        val data = dataOverride ?: withTimeoutOrNull(2_000) { readHtml(webView) }.orEmpty()
         return WafResult(data, cookieHeader, map, ua, url)
     }
 

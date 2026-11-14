@@ -76,7 +76,7 @@ fun CatalogScreen(
 
     Column(Modifier.fillMaxSize()) {
         Row(
-            Modifier.fillMaxWidth().padding(start = 24.dp, end = 32.dp, top = 24.dp, bottom = 12.dp),
+            Modifier.fillMaxWidth().padding(start = 24.dp, end = 24.dp, top = 16.dp, bottom = 10.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             IconButton(
@@ -114,7 +114,7 @@ fun CatalogScreen(
                 horizontalArrangement = Arrangement.spacedBy(16.dp),
                 verticalArrangement = Arrangement.spacedBy(16.dp),
                 contentPadding = PaddingValues(
-                    start = 32.dp, end = 32.dp, top = 8.dp, bottom = 48.dp,
+                    start = 24.dp, end = 24.dp, top = 4.dp, bottom = 40.dp,
                 ),
                 modifier = Modifier.fillMaxSize(),
             ) {
@@ -127,7 +127,10 @@ fun CatalogScreen(
                         title = post.title,
                         poster = post.image,
                         tag = post.cornerTag ?: post.tag,
-                        onClick = { onOpenPost(post) },
+                        onClick = {
+                            vm.cancelPending()
+                            onOpenPost(post)
+                        },
                         modifier = if (i == 0) Modifier.focusRequester(firstCardFocus) else Modifier,
                     )
                 }

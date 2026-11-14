@@ -6,6 +6,8 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -15,6 +17,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -44,6 +47,7 @@ fun SearchScreen(
 ) {
     val state by vm.state.collectAsStateWithLifecycle()
     val wafUrl by vm.wafUrl.collectAsStateWithLifecycle()
+    val searchedQuery by vm.searchedQuery.collectAsStateWithLifecycle()
     var query by remember { mutableStateOf("") }
     val fieldFocus = remember { FocusRequester() }
     LaunchedEffect(Unit) { runCatching { fieldFocus.requestFocus() } }
@@ -54,6 +58,8 @@ fun SearchScreen(
             onValueChange = { query = it },
             placeholder = { Text("Search movies, shows…") },
             singleLine = true,
+            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+            keyboardActions = KeyboardActions(onSearch = { vm.search(query) }),
             modifier = Modifier.fillMaxWidth().focusRequester(fieldFocus),
         )
         Button(
@@ -75,7 +81,7 @@ fun SearchScreen(
                 // focusable — on a TV that leaves the results area unable to take
                 // focus at all. Route through the shared empty state instead.
                 EmptyState(
-                    message = "No results for \"$query\"",
+                    message = "No results for \"$searchedQuery\"",
                     actionLabel = "Search again",
                     onAction = { vm.search(query) },
                 )
@@ -86,7 +92,7 @@ fun SearchScreen(
                     // lands on the only child, the list cannot scroll, and the
                     // key press is swallowed. A plain row lets UP return to the
                     // search field and the Search button.
-                    title = "Results for \"$query\"",
+                    title = "Results for \"$searchedQuery\"",
                     posts = s.data,
                     onOpenPost = onOpenPost,
                     onSeeAll = null,

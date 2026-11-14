@@ -9,6 +9,8 @@ import androidx.documentfile.provider.DocumentFile
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -37,6 +39,12 @@ class SyncService(private val context: Context) {
     var watchlist: (suspend () -> List<WatchItem>)? = null
     var applyHistory: (suspend (List<WatchEntry>) -> Unit)? = null
     var applyWatchlist: (suspend (List<WatchItem>) -> Unit)? = null
+    var deleteHistory: (suspend (String, String) -> Unit)? = null
+
+    // A deletion must not race a shared-folder merge that still contains the
+    // old manifest: otherwise the card vanishes, the merge re-adds it, and the
+    // user sees the deleted item return seconds later.
+    private val syncMutex = Mutex()
 
     suspend fun deviceId(): String {
         val cur = app.syncStore.data.map { it[deviceKey] }.first()
@@ -60,9 +68,38 @@ class SyncService(private val context: Context) {
 
     suspend fun addTombstone(t: Tombstone) {
         val cur = tombs()
-        cur.removeAll { it.kind == t.kind && (it.id == t.id || (it.mediaKey.isNotBlank() && it.mediaKey == t.mediaKey)) }
+        cur.removeAll { it.kind == t.kind && (it.id == t.id || (t.mediaKey.isNotBlank() && it.mediaKey == t.mediaKey)) }
         cur.add(t)
         app.syncStore.edit { it[tombsKey] = json.encodeToString(cur.takeLast(200)) }
+    }
+
+    /**
+     * Delete one Continue Watching entry and publish that deletion.
+     *
+     * Removing only the local DataStore row hid the card until the next Home
+     * refresh ran [syncFromSharedFolder], which merged the pre-deletion
+     * manifest and put the card back. The tombstone is written first, under
+     * the same lock as the merge, so an in-flight sync can never resurrect it.
+     */
+    suspend fun removeHistory(mediaId: String, link: String = "") = withContext(Dispatchers.IO) {
+        syncMutex.withLock {
+            val entries = history?.invoke().orEmpty()
+            val entry = entries.firstOrNull { it.mediaId == mediaId }
+                ?: entries.firstOrNull { link.isNotBlank() && it.link == link }
+            // The provider link is the stable identity across devices; the
+            // media id can differ for the same episode (quality/source URL).
+            val key = link.ifBlank { entry?.link.orEmpty() }
+            addTombstone(
+                Tombstone(
+                    kind = "history",
+                    id = mediaId.ifBlank { key },
+                    mediaKey = key,
+                    deletedAt = System.currentTimeMillis(),
+                ),
+            )
+            deleteHistory?.invoke(mediaId, key)
+            publishLocked()
+        }
     }
 
     private fun syncDir(): File = File(app.filesDir, SYNC_DIR).apply { mkdirs() }
@@ -76,14 +113,26 @@ class SyncService(private val context: Context) {
         return r
     }
 
-    /** Build + publish our manifest (debounced by callers). */
+    /**
+     * Build + publish our manifest.
+     *
+     * Callers may fire this at any time (post-playback, watchlist edits).
+     * Taking the same lock as deletion/merge prevents a stale snapshot taken
+     * before a deletion from overwriting the tombstoned manifest afterwards:
+     * that race made a deleted Continue Watching card return seconds later.
+     */
     suspend fun publish() = withContext(Dispatchers.IO) {
+        syncMutex.withLock { publishLocked() }
+    }
+
+    private suspend fun publishLocked() {
         val did = deviceId()
         val h = history?.invoke().orEmpty().take(50).map {
             SyncedHistory(
                 id = it.mediaId, title = it.title, poster = it.posterUrl, provider = it.provider,
                 link = it.link, duration = it.durationMs, currentTime = it.positionMs,
-                episodeTitle = it.episodeTitle, episode = it.episodeIndex, updatedAt = it.updatedAt,
+                episodeTitle = it.episodeTitle, episode = it.episodeIndex,
+                type = it.mediaType, updatedAt = it.updatedAt,
             )
         }
         val w = watchlist?.invoke().orEmpty().map {
@@ -98,6 +147,7 @@ class SyncService(private val context: Context) {
 
     /** Read all manifests (local + shared SAF root) and merge. */
     suspend fun syncFromSharedFolder() = withContext(Dispatchers.IO) {
+        syncMutex.withLock {
         val files = mutableListOf<File>()
         syncDir().listFiles { f -> f.name.startsWith("vega-") && f.extension == "json" }?.let { files.addAll(it) }
         // Shared SAF root manifests are copied locally first (cheap, small JSON).
@@ -129,7 +179,7 @@ class SyncService(private val context: Context) {
 
         // History: top-30 by recency across devices → continue watching.
         val hist = manifests.flatMap { it.history }
-            .filter { !suppressed("history", it.id, "", it.updatedAt) }
+            .filter { !suppressed("history", it.id, it.link, it.updatedAt) }
             .sortedByDescending { it.updatedAt }.take(30)
         if (hist.isNotEmpty()) {
             applyHistory?.invoke(
@@ -137,7 +187,8 @@ class SyncService(private val context: Context) {
                     WatchEntry(
                         mediaId = it.id.ifBlank { it.link }, title = it.title, episodeTitle = it.episodeTitle,
                         posterUrl = it.poster, positionMs = it.currentTime, durationMs = it.duration,
-                        updatedAt = it.updatedAt, link = it.link, provider = it.provider, episodeIndex = it.episode,
+                        updatedAt = it.updatedAt, link = it.link, provider = it.provider,
+                        episodeIndex = it.episode, mediaType = it.type,
                     )
                 },
             )
@@ -146,11 +197,13 @@ class SyncService(private val context: Context) {
         // Watchlist: replace with newest full list (same as web applyRemoteWatchList).
         val newestWl = manifests.maxByOrNull { it.revision }?.watchlist
         if (newestWl != null) {
-            val filtered = newestWl.filter { !suppressed("watchlist", it.link, "", it.updatedAt) }
+            val filtered = newestWl.filter { !suppressed("watchlist", it.link, it.link, it.updatedAt) }
             applyWatchlist?.invoke(filtered.map { WatchItem(it.title, it.poster, it.link, it.provider, it.updatedAt) })
         }
 
-        // Republish merged view.
-        publish()
+        // Republish merged view. The lock is already held: publish() would
+        // deadlock because Kotlin's Mutex is not reentrant.
+        publishLocked()
+        }
     }
 }

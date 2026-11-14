@@ -51,6 +51,17 @@ class ProviderJs(appContext: Context) {
     private var web: WebView? = null
     private var runtimeReadyFor: String? = null
 
+    /** True while [invoke] holds the realm; teardown must not cut one in half. */
+    @Volatile
+    private var invokeInFlight = false
+
+    /** Serialises the in-flight flag with the teardown decision. */
+    private val invokeState = Any()
+    private var destroyAfterInvoke = false
+
+    /** Export currently running in the realm; decides what may be aborted. */
+    private var activeInvokeExport: String? = null
+
     /** Persistent, per-provider key/value store backing `providerContext.kvStore`. */
     private val kv = ProviderKv(ctx)
 
@@ -250,6 +261,21 @@ class ProviderJs(appContext: Context) {
     private data class CatalogBundle(
         val catalog: List<CatalogEntry> = emptyList(),
         val genres: List<CatalogEntry> = emptyList(),
+        val catalogType: String = "",
+        val genresType: String = "",
+    )
+
+    /**
+     * Static catalog exports are evaluated directly; providers such as the
+     * current Kartoons bundle export `catalog` as an async function because it
+     * has to establish a device session before it can list categories. The
+     * type markers let [ProviderManager] choose the invoke path for those.
+     */
+    data class CatalogEval(
+        val catalog: List<CatalogEntry>,
+        val genres: List<CatalogEntry>,
+        val catalogIsFunction: Boolean,
+        val genresIsFunction: Boolean,
     )
 
     /**
@@ -260,7 +286,7 @@ class ProviderJs(appContext: Context) {
      * Takes the same lock as invoke(): the catalog path is a plain evaluateJavascript
      * and must not interleave with a loadDataWithBaseURL realm swap.
      */
-    suspend fun evalCatalog(moduleCode: String): Pair<List<CatalogEntry>, List<CatalogEntry>> = lock.withLock {
+    suspend fun evalCatalog(moduleCode: String): CatalogEval = lock.withLock {
         require(moduleCode.length < 2 * 1024 * 1024) { "Module exceeds 2MB" }
         val w = webView()
         // The catalog is static, but it still needs a realm with a JS context.
@@ -278,19 +304,33 @@ var exports={};var module={exports:exports};
 // global-scope where "use strict" bundles throw ReferenceError.
 try{ eval(`$safe`); }catch(e){ return JSON.stringify({error:String(e&&e.message||e)}); }
 var m=(module&&module.exports)||{};var out={};
-try{ out.catalog=(m.catalog||exports.catalog||[]); }catch(e){ out.catalog=[]; }
-try{ out.genres=(m.genres||exports.genres||[]); }catch(e){ out.genres=[]; }
-return JSON.stringify({catalog:out.catalog,genres:out.genres});
+try{
+  var c=(m.catalog!==undefined?m.catalog:exports.catalog);
+  var g=(m.genres!==undefined?m.genres:exports.genres);
+  out.catalogType=typeof c;
+  out.genresType=typeof g;
+  out.catalog=Array.isArray(c)?c:[];
+  out.genres=Array.isArray(g)?g:[];
+}catch(e){ out.catalog=[];out.genres=[]; }
+return JSON.stringify({catalog:out.catalog,genres:out.genres,catalogType:out.catalogType,genresType:out.genresType});
 })()"""
         val raw = evalString(script)
         // Error path: {"error":"..."} without catalog keys.
         val bundle = runCatching { json.decodeFromString<CatalogBundle>(raw) }.getOrNull()
             ?: throw IllegalStateException("Catalog eval failed: ${raw.take(200)}")
-        if (bundle.catalog.isEmpty() && bundle.genres.isEmpty()) {
+        if (bundle.catalog.isEmpty() && bundle.genres.isEmpty() &&
+            !bundle.catalogType.equals("function", true) &&
+            !bundle.genresType.equals("function", true)
+        ) {
             // The bundle threw; evalCatalog's own catch swallowed it into empty lists.
             Log.w(TAG, "Catalog bundle produced no entries: ${raw.take(200)}")
         }
-        bundle.catalog to bundle.genres
+        CatalogEval(
+            catalog = bundle.catalog,
+            genres = bundle.genres,
+            catalogIsFunction = bundle.catalogType.equals("function", true),
+            genresIsFunction = bundle.genresType.equals("function", true),
+        )
     }
 
     @Serializable
@@ -319,13 +359,26 @@ return JSON.stringify({catalog:out.catalog,genres:out.genres});
     ): String {
         require(moduleCode.length < 2 * 1024 * 1024) { "Module exceeds 2MB" }
         lock.withLock {
-            return kotlinx.coroutines.withTimeout(timeoutMs + 30_000) {
+            synchronized(invokeState) {
+                invokeInFlight = true
+                activeInvokeExport = exportName
+                destroyAfterInvoke = false
+            }
+            try {
+                // The JS budget pauses while a WAF dialog is open, so the native
+                // backstop has to leave room for the human as well.
+                return kotlinx.coroutines.withTimeout(timeoutMs + 210_000) {
                 try {
                     ensureRuntime(providerKey)
                     val bridge = http ?: throw IllegalStateException("Native bridge not attached")
+                    // Correlates this invoke's result/state with the JS promise.
+                    // Cancellation cannot stop JS already running, so an orphan
+                    // result must be dropped rather than completing this invoke.
+                    val invokeId = java.util.UUID.randomUUID().toString()
                     primeKv(bridge, providerKey)
                     refreshBaseUrls(bridge)
                     bridge.stateCapture = null
+                    bridge.stateCaptureId = null
                     // Fresh module scope per invoke (no cross-provider leakage).
                     evalString("window.__vegaReset()", 10_000)
                     // providerGlobal: whatever the previous invoke saved, so a
@@ -361,12 +414,14 @@ return JSON.stringify({catalog:out.catalog,genres:out.genres});
                     require(!loadResult.startsWith("ERR:")) { "Module load failed: ${loadResult.take(300)}" }
                     trace("module loaded: $providerKey/$exportName (${moduleCode.length}b)")
                     val invokeScript =
-                        "window.__vegaInvoke(${jsString(exportName)},{\"params\":$paramsJson,\"commonHeaders\":$commonHeadersJson,\"timeoutMs\":$timeoutMs,\"providerValue\":${jsString(providerKey)}})"
+                        "window.__vegaInvoke(${jsString(exportName)},{\"params\":$paramsJson,\"commonHeaders\":$commonHeadersJson,\"timeoutMs\":$timeoutMs,\"providerValue\":${jsString(providerKey)},\"invokeId\":${jsString(invokeId)}})"
                     // evaluateJavascript cannot return a promise, so the runtime pushes
                     // the result through VegaHttp.result(). Register the listener before
                     // starting the invoke, so a fast result cannot arrive unobserved.
                     val deferred = kotlinx.coroutines.CompletableDeferred<String>()
-                    bridge.onResult = { payload -> deferred.complete(payload) }
+                    bridge.onResult = { id, payload ->
+                        if (id == invokeId) deferred.complete(payload)
+                    }
                     val raw = try {
                         val started = evalRaw(invokeScript, 15_000)
                         if (started == null) {
@@ -377,21 +432,26 @@ return JSON.stringify({catalog:out.catalog,genres:out.genres});
                         // on its own as soon as no request is outstanding.
                         val pump = launch { pumpOpenWebView(bridge) }
                         try {
-                            withTimeout(timeoutMs + 20_000) { deferred.await() }
+                            withTimeout(timeoutMs + 200_000) { deferred.await() }
                         } finally {
                             pump.cancel()
                         }
                     } finally {
                         bridge.onResult = null
                         flushKv(bridge, providerKey)
-                        bridge.stateCapture?.let { saved ->
-                            bridge.stateCapture = null
-                            if (saved.length <= MAX_PROVIDER_STATE_CHARS) {
-                                providerState[providerKey] = saved
-                            } else {
-                                trace("providerGlobal dropped (${saved.length}b)")
+                        // Only the invoke that produced this state may commit it:
+                        // an orphaned JS promise can land during the next invoke.
+                        if (bridge.stateCaptureId == invokeId) {
+                            bridge.stateCapture?.let { saved ->
+                                if (saved.length <= MAX_PROVIDER_STATE_CHARS) {
+                                    providerState[providerKey] = saved
+                                } else {
+                                    trace("providerGlobal dropped (${saved.length}b)")
+                                }
                             }
                         }
+                        bridge.stateCapture = null
+                        bridge.stateCaptureId = null
                     }
                     val env = runCatching { json.decodeFromString<InvokeEnvelope>(raw) }.getOrNull()
                         ?: throw IllegalStateException("Bad invoke envelope: ${raw.take(300)}")
@@ -404,6 +464,21 @@ return JSON.stringify({catalog:out.catalog,genres:out.genres});
                     Log.e(TAG, "invoke $exportName failed for $providerKey: ${e.message}", e)
                     throw e
                 }
+            }
+            } finally {
+                val teardown = synchronized(invokeState) {
+                    invokeInFlight = false
+                    activeInvokeExport = null
+                    if (destroyAfterInvoke) {
+                        destroyAfterInvoke = false
+                        true
+                    } else {
+                        false
+                    }
+                }
+                // Still holding the invoke mutex, so a new provider call cannot
+                // observe the old page between these two statements.
+                if (teardown) destroy()
             }
         }
     }
@@ -473,15 +548,32 @@ return JSON.stringify({catalog:out.catalog,genres:out.genres});
      * appears once the WAF route calls back. This is the pump that connects them.
      */
     private suspend fun pumpOpenWebView(bridge: ProviderHttp) {
-        while (bridge.openRequests.isNotEmpty()) {
-            val entry = bridge.openRequests.entries.firstOrNull() ?: return
+        while (true) {
+            val entry = bridge.openRequests.entries.firstOrNull()
+            if (entry == null) {
+                // The provider may still be fetching the page that will ask
+                // for a challenge. This pump used to exit on the first empty
+                // poll, so a request arriving a moment later was never shown.
+                delay(100)
+                continue
+            }
             val id = entry.key
             val req = entry.value
+            trace("openWebView challenge: ${req.url}")
             // A provider waiting on a human must not take the invoke mutex with
             // it, or no other provider call could start while the challenge is
             // on screen. Only the RPC layer is touched, so it is safe.
             try {
-                val res = WafCoordinator.open(req.url, req.waitForCookie, req.waitForLoad)
+                val res = WafCoordinator.open(
+                    req.url,
+                    req.waitForCookie,
+                    req.waitForLoad,
+                    req.headers,
+                    req.injectedJavaScript,
+                    req.timeoutMs,
+                    req.title,
+                    req.description,
+                )
                 bridge.openResults[id] = resultJson(res)
             } catch (e: Exception) {
                 bridge.openResults[id] = errorJson(e.message ?: "dismissed")
@@ -506,9 +598,47 @@ return JSON.stringify({catalog:out.catalog,genres:out.genres});
     private fun errorJson(msg: String) =
         org.json.JSONObject().put("ok", false).put("error", msg).toString()
 
+    /**
+     * Tear the hidden renderer down once a video is actually playing: its
+     * process and any in-page provider timers must not compete with the
+     * decoder. Rebuilt lazily by the next [invoke].
+     *
+     * If an invoke is in flight, the teardown is deferred to the instant it
+     * unwinds. The old implementation silently skipped the teardown in that
+     * case, leaving the provider page (and its timers) alive for the whole
+     * film. The state lock is what makes the deferred decision race-free: a
+     * player resolve that starts while the flag is set is never torn down.
+     */
+    fun suspendForPlayback() {
+        val (destroyNow, abortHttp) = synchronized(invokeState) {
+            if (invokeInFlight) {
+                destroyAfterInvoke = true
+                // A feed/meta/episode call can be aborted so its network work
+                // stops now instead of at the provider's 45–120s deadline.
+                // Never abort getStream: that is the call the player is
+                // waiting for; it is allowed to finish naturally.
+                false to (activeInvokeExport != "getStream")
+            } else {
+                true to false
+            }
+        }
+        if (abortHttp) http?.cancelActiveCalls()
+        if (destroyNow) destroy()
+    }
+
     fun destroy() {
         WafCoordinator.cancelAll()
-        main.post { runCatching { web?.destroy() }; web = null }
+        http?.cancelActiveCalls()
+        http = null
+        activeBridge = null
+        loadGeneration++
+        // Capture this page before posting. Destroying `web` inside the post
+        // could otherwise kill a replacement page created in the meantime.
+        val doomed = web
+        web = null
+        if (doomed != null) {
+            main.post { runCatching { doomed.destroy() } }
+        }
         runtimeReadyFor = null
     }
 }
