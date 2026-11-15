@@ -17,6 +17,7 @@ import tv.vega.tv.player.PlaybackSession
 import tv.vega.tv.player.qualityScore
 import tv.vega.tv.ui.common.UiState
 import tv.vega.tv.ui.common.episodeNumber
+import tv.vega.tv.ui.common.seasonNumberFromTitle
 
 data class ResolvedSeason(
     val title: String,
@@ -51,7 +52,7 @@ private val SEASON_NUMBER = Regex(
 )
 private val BARE_SEASON_NUMBER = Regex("""^\s*0*(\d{1,3})\s*$""")
 
-private fun seasonNumberOf(title: String): Int? {
+internal fun seasonNumberOf(title: String): Int? {
     val fromPhrase = SEASON_NUMBER.find(title)
         ?.groupValues
         ?.drop(1)
@@ -253,10 +254,21 @@ class DetailViewModel : ViewModel() {
                             raw.sortedByDescending { qualityScore(it.title) }
                         } else {
                             // Providers list newest-first often enough that the
-                            // first card used to be the last episode. Numbered
-                            // titles are sorted by their real number; titles
-                            // without one keep the provider's order.
-                            raw.sortedBy { episodeNumber(it).toIntOrNull() ?: it.number }
+                            // first card used to be the last episode. Titles
+                            // that name a season and episode are sorted by that
+                            // pair; titles without one keep the provider's order
+                            // (the sort is stable, so equal keys never move).
+                            //
+                            // Season comes first because one detail can carry
+                            // every season as a flat list ("S01E01…, S02E01…"):
+                            // ordering by episode number alone interleaved them
+                            // as S1E1, S2E1, S3E1, S1E2.
+                            raw.sortedWith(
+                                compareBy(
+                                    { seasonNumberFromTitle(it.title) ?: 0 },
+                                    { episodeNumber(it).toIntOrNull() ?: Int.MAX_VALUE },
+                                ),
+                            )
                         }
                         val id = if (movie) SeasonIdentity("", "", null) else identities[index]
                         resolved[index] = ResolvedSeason(

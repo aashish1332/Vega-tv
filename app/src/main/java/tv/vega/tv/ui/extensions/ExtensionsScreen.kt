@@ -145,9 +145,14 @@ class ExtensionsViewModel : ViewModel() {
         val cached = src?.let { pm.store.available(it.author) }.orEmpty()
         var avail = cached
         if (src != null) {
-            avail = runCatching { pm.refreshSource(src, force = false) }
-                .getOrDefault(cached)
-                .filter { !it.disabled }
+            avail = try {
+                pm.refreshSource(src, force = false)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                // Leaving the screen is not "the source is unreachable".
+                throw e
+            } catch (_: Exception) {
+                cached
+            }.filter { !it.disabled }
         }
         val upd = avail.filter { a ->
             installed.any { i ->
@@ -269,9 +274,18 @@ class ExtensionsViewModel : ViewModel() {
                 ?: error("no playable link")
             val streams = pm.getStream(a, epLink, meta.type.ifBlank { "movie" })
             require(streams.isNotEmpty()) { "no streams returned" }
+        } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
+            // A provider that ran out its own budget is a failed stage, not a
+            // viewer walking away: say which stage stopped instead of leaving
+            // the busy banner up.
+            _result.value = "✗ ${ext.display_name} failed at $stage: ${e.message?.take(140)}"
+            return@run
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            // The viewer left mid-test: not a failed stage.
+            throw e
         } catch (e: Exception) {
             _result.value = "✗ ${ext.display_name} failed at $stage: ${e.message?.take(140)}"
-            throw e
+            return@run
         }
         _result.value = "✓ ${ext.display_name} working"
     }

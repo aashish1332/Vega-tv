@@ -3,9 +3,12 @@
 import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
+import android.graphics.Canvas
+import android.graphics.Paint
 import android.os.SystemClock
 import android.view.KeyEvent as AndroidKeyEvent
 import android.view.MotionEvent
+import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.view.inputmethod.InputMethodManager
@@ -14,6 +17,7 @@ import android.webkit.WebChromeClient
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.FrameLayout
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -66,79 +70,54 @@ import kotlin.math.roundToInt
 private enum class NavMode { Page, Pointer }
 
 /**
- * A DOM-drawn pointer.
+ * The D-pad cursor, painted natively above the WebView.
  *
- * Compose content and a native WebView cannot be layered reliably: the
- * AndroidView is a real child View and is painted after Compose's own draw
- * pass, so a Compose cursor box behind it is invisible. The cursor therefore
- * lives in the page itself, in a fixed, pointer-events:none element above
- * every site layer (including cross-origin challenge iframes).
+ * It used to be a fixed-position element injected into the page. That fails in
+ * exactly the ways a challenge page is built to fail: a page that rewrites its
+ * DOM removes the element, a page with its own top layers covers it, and a page
+ * busy running the challenge executes `evaluateJavascript` late — so the cursor
+ * lagged behind the keys that moved it, or never appeared at all. A real View
+ * added to the same FrameLayout *after* the WebView is drawn over it by the
+ * window system every time, is invisible to page script, and moves in the same
+ * frame as the key event that moved it.
  */
-private val PAGE_POINTER_JS = """
-    (function () {
-      if (window.__vegaPointerReady) return;
-      window.__vegaPointerReady = true;
-      var el = null;
-      function ensure() {
-        if (!el) {
-          el = document.createElement('div');
-          el.id = '__vega_pointer';
-          el.setAttribute('aria-hidden', 'true');
-          var s = el.style;
-          s.position = 'fixed';
-          s.left = '50%';
-          s.top = '50%';
-          s.width = '20px';
-          s.height = '20px';
-          s.marginLeft = '-10px';
-          s.marginTop = '-10px';
-          s.borderRadius = '50%';
-          s.border = '2px solid #ffffff';
-          s.background = 'rgba(8, 14, 24, 0.55)';
-          s.boxShadow = '0 0 0 2px #4da3ff, 0 2px 10px rgba(0,0,0,0.7)';
-          s.zIndex = '2147483647';
-          s.pointerEvents = 'none';
-          s.boxSizing = 'border-box';
-          s.display = 'none';
-        }
-        var root = document.documentElement || document.body;
-        if (root && el.parentNode !== root) root.appendChild(el);
-        return el;
-      }
-      window.__vegaPointerSet = function (x, y, w, h) {
-        var e = ensure();
-        if (!w || !h) return;
-        var cw = window.innerWidth || w;
-        var ch = window.innerHeight || h;
-        e.style.left = (x * cw / w) + 'px';
-        e.style.top = (y * ch / h) + 'px';
-        e.style.display = 'block';
-      };
-      window.__vegaPointerShow = function () { ensure().style.display = 'block'; };
-      window.__vegaPointerHide = function () { if (el) el.style.display = 'none'; };
-    })()
-""".trimIndent()
-
-/** Position the in-page cursor using WebView device pixels. */
-private fun WebView.setPageCursor(x: Float, y: Float) {
-    if (width <= 0 || height <= 0) return
-    val px = x.coerceIn(0f, (width - 1).coerceAtLeast(0).toFloat())
-    val py = y.coerceIn(0f, (height - 1).coerceAtLeast(0).toFloat())
-    runCatching {
-        evaluateJavascript(
-            "window.__vegaPointerSet&&window.__vegaPointerSet($px,$py,$width,$height)",
-            null,
-        )
+private class PointerOverlay(c: Context) : View(c) {
+    private val density = resources.displayMetrics.density
+    private val radius = 9f * density
+    private val halo = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x66000000 }
+    private val ring = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0xFFFFFFFF.toInt()
+        style = Paint.Style.STROKE
+        strokeWidth = 2.5f * density
     }
-}
+    private val dot = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF4DA3FF.toInt() }
+    private var cx = -1f
+    private var cy = -1f
 
-private fun WebView.setPageCursorVisible(visible: Boolean) {
-    runCatching {
-        evaluateJavascript(
-            if (visible) "window.__vegaPointerShow&&window.__vegaPointerShow()"
-            else "window.__vegaPointerHide&&window.__vegaPointerHide()",
-            null,
-        )
+    init {
+        // Never a target: the WebView under it keeps touch and key focus.
+        isClickable = false
+        isFocusable = false
+        importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_NO
+    }
+
+    fun moveTo(x: Float, y: Float) {
+        if (x == cx && y == cy) return
+        cx = x
+        cy = y
+        invalidate()
+    }
+
+    fun showAt(x: Float, y: Float) {
+        if (visibility != VISIBLE) visibility = VISIBLE
+        moveTo(x, y)
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        if (cx < 0f || cy < 0f) return
+        canvas.drawCircle(cx, cy, radius + 2.5f * density, halo)
+        canvas.drawCircle(cx, cy, radius, ring)
+        canvas.drawCircle(cx, cy, radius * 0.45f, dot)
     }
 }
 
@@ -453,7 +432,12 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
     var status by remember { mutableStateOf("Loading page…") }
     var done by remember { mutableStateOf(false) }
     var webView by remember { mutableStateOf<WebView?>(null) }
-    var mode by remember { mutableStateOf(NavMode.Page) }
+    var pointerOverlay by remember { mutableStateOf<PointerOverlay?>(null) }
+    // Pointer is the default: the first thing a viewer does on this screen is
+    // look for a cursor, and a screen that opens in page-focus mode has none
+    // until they find the toolbar toggle. Page mode is one press away for form
+    // navigation and the keyboard hand-off.
+    var mode by remember { mutableStateOf(NavMode.Pointer) }
     val toolbarFocus = remember { FocusRequester() }
     val webViewFocus = remember { FocusRequester() }
     // Pointer keys arrive on the WebView's key listener (the page always keeps
@@ -579,10 +563,10 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
                 else cursorY = (cursorY + step).coerceAtMost(maxY)
             }
         }
-        // The cursor is painted by the page, not Compose, so it stays above
-        // the native WebView surface and over cross-origin challenge iframes.
-        if (wv != null && cursorX >= 0f && cursorY >= 0f) {
-            wv.setPageCursor(cursorX, cursorY)
+        // The cursor is a real View above the WebView: no page script, no
+        // evaluateJavascript queue, no lag.
+        if (cursorX >= 0f && cursorY >= 0f) {
+            pointerOverlay?.showAt(cursorX, cursorY)
         }
     }
 
@@ -610,15 +594,14 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
         mode == NavMode.Pointer && handlePointerKeyCode(keyCode, repeatCount)
     }
 
-    /** Force the page cursor to the centre after a toolbar round trip. */
+    /** Force the cursor to the centre after a toolbar round trip. */
     fun recenterPointer() {
         val wv = webView ?: return
         if (wv.width <= 0 || wv.height <= 0) return
         cursorX = wv.width / 2f
         cursorY = wv.height / 2f
         if (mode == NavMode.Pointer) {
-            wv.setPageCursor(cursorX, cursorY)
-            wv.setPageCursorVisible(true)
+            pointerOverlay?.showAt(cursorX, cursorY)
         }
         wv.requestFocus()
     }
@@ -708,14 +691,16 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
     LaunchedEffect(pendingId, webView, mode) {
         val wv = webView ?: return@LaunchedEffect
         if (mode == NavMode.Pointer) {
-            if (cursorX < 0f || cursorY < 0f) {
+            // Width is 0 until the WebView is laid out; leaving the cursor
+            // unset (-1) lets the size callback centre it, instead of pinning
+            // it to the top-left corner of the page.
+            if (wv.width > 0 && wv.height > 0 && (cursorX < 0f || cursorY < 0f)) {
                 cursorX = wv.width / 2f
                 cursorY = wv.height / 2f
             }
-            wv.setPageCursor(cursorX, cursorY)
-            wv.setPageCursorVisible(true)
+            if (cursorX >= 0f && cursorY >= 0f) pointerOverlay?.showAt(cursorX, cursorY)
         } else {
-            wv.setPageCursorVisible(false)
+            pointerOverlay?.visibility = View.GONE
         }
         repeat(3) {
             withFrameNanos { }
@@ -737,7 +722,7 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
         done = false
         bridgeSettled.set(false)
         status = "Loading page…"
-        mode = NavMode.Page
+        mode = NavMode.Pointer
     }
 
     DisposableEffect(pendingId) {
@@ -752,9 +737,7 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
         Modifier.fillMaxSize().onPreviewKeyEvent { event ->
             // Moving down from the toolbar enters the page. Keys inside the
             // WebView never reach Compose, which is exactly what we want.
-            if (event.type == KeyEventType.KeyDown && event.key == Key.DirectionDown &&
-                mode == NavMode.Page
-            ) {
+            if (event.type == KeyEventType.KeyDown && event.key == Key.DirectionDown) {
                 val wv = webView
                 if (wv != null && !wv.hasFocus()) {
                     runCatching { wv.requestFocus() }
@@ -821,7 +804,7 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
             if (mode == NavMode.Page) {
                 "D-pad navigates · OK selects · UP at the top opens the toolbar · BACK goes back"
             } else {
-                "Pointer: D-pad moves · OK taps · hold at an edge to scroll · BACK returns to page"
+                "D-pad moves the cursor · OK taps · MENU for the toolbar · BACK switches to page mode"
             },
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -839,12 +822,21 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
                     cursorX = cursorX.coerceIn(0f, (size.width - 1).coerceAtLeast(0).toFloat())
                     cursorY = cursorY.coerceIn(0f, (size.height - 1).coerceAtLeast(0).toFloat())
                 }
-                if (mode == NavMode.Pointer) webView?.setPageCursor(cursorX, cursorY)
+                if (mode == NavMode.Pointer) {
+                    if (cursorX >= 0f && cursorY >= 0f) {
+                        pointerOverlay?.showAt(cursorX, cursorY)
+                    }
+                }
             },
         ) {
             key(challenge?.id) {
                 AndroidView(
                     factory = { c ->
+                        // The cursor must be a sibling painted *after* the
+                        // WebView: Android draws children in order, so an
+                        // overlay View cannot be hidden by page layers,
+                        // cross-origin iframes, or a site that rewrites its DOM.
+                        val frame = FrameLayout(c)
                         WebView(c).apply {
                             layoutParams = ViewGroup.LayoutParams(
                                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -960,17 +952,19 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
                                         view?.evaluateJavascript(it, null)
                                     }
                                     view?.evaluateJavascript(SPATIAL_NAV_JS, null)
-                                    // The pointer element must exist before the
-                                    // first D-pad press; its coordinates are
-                                    // kept in native state and re-applied here.
-                                    view?.evaluateJavascript(PAGE_POINTER_JS, null)
-                                    if (view != null && mode == NavMode.Pointer) {
-                                        if (cursorX < 0f || cursorY < 0f) {
+                                    // A new document must not leave the pointer
+                                    // hidden: the overlay is native and outlives
+                                    // every page load.
+                                    if (mode == NavMode.Pointer) {
+                                        if (view != null && view.width > 0 && view.height > 0 &&
+                                            (cursorX < 0f || cursorY < 0f)
+                                        ) {
                                             cursorX = view.width / 2f
                                             cursorY = view.height / 2f
                                         }
-                                        view.setPageCursor(cursorX, cursorY)
-                                        view.setPageCursorVisible(true)
+                                        if (cursorX >= 0f && cursorY >= 0f) {
+                                            pointerOverlay?.showAt(cursorX, cursorY)
+                                        }
                                     }
                                     if (!done) {
                                         status = when {
@@ -996,18 +990,39 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
                             pendingId?.let { WafCoordinator.attach(it, this) }
                             if (headers.isEmpty()) loadUrl(targetUrl)
                             else loadUrl(targetUrl, headers)
+                            frame.addView(
+                                this,
+                                FrameLayout.LayoutParams(
+                                    ViewGroup.LayoutParams.MATCH_PARENT,
+                                    ViewGroup.LayoutParams.MATCH_PARENT,
+                                ),
+                            )
+                            val overlay = PointerOverlay(c)
+                            frame.addView(
+                                overlay,
+                                FrameLayout.LayoutParams(
+                                    ViewGroup.LayoutParams.MATCH_PARENT,
+                                    ViewGroup.LayoutParams.MATCH_PARENT,
+                                ),
+                            )
+                            pointerOverlay = overlay
                         }
+                        frame
                     },
-                    update = { view ->
-                        view.isFocusable = true
-                        view.isFocusableInTouchMode = true
+                    update = { frame ->
+                        val wv = frame.getChildAt(0) as? WebView
+                        wv?.isFocusable = true
+                        wv?.isFocusableInTouchMode = true
                     },
                     modifier = Modifier.fillMaxSize().focusRequester(webViewFocus),
-                    onRelease = { view ->
-                        runCatching { (view.parent as? ViewGroup)?.removeView(view) }
-                        runCatching { view.stopLoading() }
-                        runCatching { view.destroy() }
-                        if (webView === view) webView = null
+                    onRelease = { frame ->
+                        val wv = frame.getChildAt(0) as? WebView
+                        val ownedOverlay = pointerOverlay?.parent === frame
+                        while (frame.childCount > 0) frame.removeViewAt(0)
+                        runCatching { wv?.stopLoading() }
+                        runCatching { wv?.destroy() }
+                        if (webView === wv) webView = null
+                        if (ownedOverlay) pointerOverlay = null
                     },
                 )
             }

@@ -2,7 +2,9 @@ package tv.vega.tv.data.providers
 
 import android.content.Context
 import android.util.Log
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -291,7 +293,24 @@ class ProviderManager(appContext: Context) {
             static.catalog
         }
         val genres = if (static.genresIsFunction) {
-            runCatching { invokeCatalogList(a, code, "genres") }.getOrDefault(emptyList())
+            try {
+                invokeCatalogList(a, code, "genres")
+            } catch (e: TimeoutCancellationException) {
+                // The optional export burned its whole budget: the catalog the
+                // viewer asked for is already in hand, so degrade to "no genre
+                // filter" instead of failing the screen.
+                Log.i(TAG, "genres timed out for ${a.ext.value}")
+                emptyList()
+            } catch (e: CancellationException) {
+                // Structured cancellation is not "this provider has no genres":
+                // swallowing it here returned a half-finished catalog to a
+                // caller that had already walked away.
+                throw e
+            } catch (_: Exception) {
+                // Genres are optional; a provider whose genre call fails still
+                // has a usable catalog.
+                emptyList()
+            }
         } else {
             static.genres
         }
@@ -322,6 +341,8 @@ class ProviderManager(appContext: Context) {
         // Some providers omit search; fall back to empty (mirrors web optional).
         val raw = try {
             guarded { js.invoke(a.ext.value, code, "getSearchPosts", params, commonHeaders()) }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             if ((e.message ?: "").contains("missing export")) return emptyList()
             throw e
@@ -345,6 +366,8 @@ class ProviderManager(appContext: Context) {
         val params = JSONObject().put("url", url).toString()
         val raw = try {
             guarded { js.invoke(a.ext.value, code, "getEpisodes", params, commonHeaders()) }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             if ((e.message ?: "").contains("missing export")) return emptyList()
             throw e
@@ -480,6 +503,14 @@ class ProviderManager(appContext: Context) {
         val code = store.readModuleCode(a.ext.value, a.source.author, "settings") ?: return emptyList()
         val raw = try {
             js.invoke(a.ext.value, code, "getSettingsSchema", "{}", commonHeaders(), timeoutMs = 6_000)
+        } catch (e: TimeoutCancellationException) {
+            // The provider's schema export did not answer in its own budget:
+            // exactly the "broken bundle, nothing to configure" case.
+            Log.i(TAG, "getSettingsSchema timed out for ${a.ext.value}")
+            return emptyList()
+        } catch (e: CancellationException) {
+            // The screen moved on: not a provider verdict.
+            throw e
         } catch (e: Exception) {
             Log.i(TAG, "getSettingsSchema unavailable for ${a.ext.value}: ${e.message}")
             return emptyList()

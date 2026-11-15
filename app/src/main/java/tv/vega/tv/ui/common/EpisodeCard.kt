@@ -328,6 +328,26 @@ private fun numberFromTitle(raw: String): Int? {
 internal fun episodeNumber(episode: EpisodeItem): String =
     (numberFromTitle(episode.title) ?: episode.number.takeIf { it > 0 })?.toString().orEmpty()
 
+private val SEASON_PHRASE = Regex(
+    """(?i)(?:\bseason\s*0*(\d{1,3})\b|\bs\s*0*(\d{1,3})\s*[.\-_ ]?\s*e(?:p)?\s*\d{1,3}\b)""",
+)
+
+/**
+ * The season an episode title names — "S02E05", "Season 2 Episode 5" — or null
+ * when it names none, which is the norm for a single-season show.
+ *
+ * A provider that flattens every season into one detail page gives a list whose
+ * titles carry the season; ordering that list by episode number alone
+ * interleaves the seasons (S1E1, S2E1, S3E1, S1E2…). This is the key's first
+ * half; see the episode sort in `DetailViewModel`.
+ */
+internal fun seasonNumberFromTitle(raw: String): Int? =
+    SEASON_PHRASE.find(raw)
+        ?.groupValues
+        ?.drop(1)
+        ?.firstOrNull { it.isNotBlank() }
+        ?.toIntOrNull()
+
 /**
  * A title a person can read, out of whatever the provider called this episode.
  *

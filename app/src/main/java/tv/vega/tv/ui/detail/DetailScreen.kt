@@ -122,8 +122,29 @@ fun DetailScreen(
             // "S1" is the default, not just the first tab a provider happened to
             // list: some sources put Specials (S0) first. A single visible group
             // needs no selector at all (movies and one-season shows).
-            val defaultGroupKey = remember(groups) {
-                groups.firstOrNull { it.number == 1 }?.key ?: groups.firstOrNull()?.key
+            //
+            // A season card in the catalog ("Doraemon Season 3") opens the same
+            // series page as that show's other season cards and carries all
+            // seasons with it; the viewer expects to land on the season they
+            // tapped instead of hunting for it in the tabs. The card title is
+            // the only season signal the handoff carries, so match it by
+            // number, else by the group's own label (named seasons have no
+            // number to match).
+            val clickedGroup = remember(groups) {
+                val clicked = PlaybackSession.pendingTitle.trim()
+                if (clicked.isBlank() || groups.size < 2) null
+                else {
+                    val number = seasonNumberOf(clicked)
+                    groups.firstOrNull { g -> number != null && g.number == number }
+                        ?: groups.firstOrNull { g ->
+                            g.label.length >= 3 && clicked.contains(g.label, ignoreCase = true)
+                        }
+                }
+            }
+            val defaultGroupKey = remember(groups, clickedGroup) {
+                clickedGroup?.key
+                    ?: groups.firstOrNull { it.number == 1 }?.key
+                    ?: groups.firstOrNull()?.key
             }
             var selectedGroupKey by remember(info.linkList) {
                 mutableStateOf<String?>(defaultGroupKey)

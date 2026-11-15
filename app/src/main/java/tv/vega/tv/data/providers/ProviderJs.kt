@@ -5,7 +5,9 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import android.webkit.WebView
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -496,6 +498,24 @@ return JSON.stringify({catalog:out.catalog,genres:out.genres,catalogType:out.cat
                         ?: throw IllegalStateException("Bad invoke envelope: ${raw.take(300)}")
                     env.__error?.let { throw IllegalStateException(it.take(500)) }
                     (env.__ok?.toString() ?: "null")
+                } catch (e: TimeoutCancellationException) {
+                    // A real timeout is a provider failure: the sandbox was given
+                    // its full budget and answered nothing. Record it before the
+                    // generic cancellation branch can swallow it.
+                    runtimeReadyFor = null
+                    lastError = "$exportName: ${e.message ?: "timed out"}"
+                    Log.e(TAG, "invoke $exportName timed out for $providerKey", e)
+                    throw e
+                } catch (e: CancellationException) {
+                    // The caller walked away — the screen closed, or a newer
+                    // request replaced this one. That is not a provider failure,
+                    // and recording it as one is how "Last error: catalog:
+                    // StandaloneCoroutine was cancelled" reached the Providers
+                    // screen. The realm is left as it is: the next invoke resets
+                    // it in-page anyway, and an orphaned JS result is dropped by
+                    // its invokeId.
+                    trace("invoke cancelled: $exportName")
+                    throw e
                 } catch (e: Exception) {
                     // Force a fresh realm next time so a stuck provider can't wedge us.
                     runtimeReadyFor = null
