@@ -1,10 +1,8 @@
 package tv.vega.tv
 
-import android.content.Context
 import android.os.Bundle
 import android.view.KeyEvent
 import android.view.WindowManager
-import android.view.inputmethod.InputMethodManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -18,7 +16,6 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -138,6 +135,20 @@ class MainActivity : ComponentActivity() {
             nav?.currentDestination?.route?.startsWith("waf") == true
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        // BACK belongs to the browser while it is up, and it must be decided
+        // here: `super.dispatchKeyEvent` can hand BACK to the WebView or to the
+        // IME window, which would swallow it before onKeyDown ever runs.
+        if (wafOnScreen() &&
+            event.action == KeyEvent.ACTION_DOWN &&
+            event.keyCode == KeyEvent.KEYCODE_BACK
+        ) {
+            if (WafKeyBus.onBack?.invoke() == true) return true
+            // The browser has nothing left to close. Dismiss it here for the
+            // same reason: no focused view gets a chance to eat BACK.
+            WafCoordinator.pending.value?.let { WafCoordinator.dismiss(it.id) }
+                ?: nav?.popBackStack()
+            return true
+        }
         // The challenge browser owns the remote while it is up, whichever view
         // happens to hold focus. Offering the key here (before the focused
         // WebView, Compose, or the player) is what makes its cursor move — a
@@ -164,14 +175,10 @@ class MainActivity : ComponentActivity() {
         val challenge = WafCoordinator.pending.value
         if (wafOnScreen()) {
             if (keyCode == KeyEvent.KEYCODE_BACK) {
-                // A keyboard opened by the sign-in page owns the first BACK.
-                if (ViewCompat.getRootWindowInsets(window.decorView)
-                        ?.isVisible(WindowInsetsCompat.Type.ime()) == true
-                ) {
-                    (getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager)
-                        ?.hideSoftInputFromWindow(window.decorView.windowToken, 0)
-                    return true
-                }
+                // The browser arbitrates its own BACK: close the keyboard,
+                // leave a focused toolbar button, leave pointer mode, or walk
+                // its history. Only an unhandled BACK dismisses the challenge.
+                if (WafKeyBus.onBack?.invoke() == true) return true
                 if (challenge != null) WafCoordinator.dismiss(challenge.id)
                 else nav?.popBackStack()
                 return true

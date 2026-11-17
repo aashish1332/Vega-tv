@@ -1,16 +1,16 @@
 ﻿package tv.vega.tv.ui.waf
 
-import android.app.Activity
 import android.content.Context
-import android.content.ContextWrapper
 import android.graphics.Canvas
 import android.graphics.Paint
+import android.graphics.Rect
+import android.os.Build
 import android.os.SystemClock
 import android.view.KeyEvent as AndroidKeyEvent
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
-import android.view.WindowManager
+import android.view.ViewTreeObserver
 import android.view.inputmethod.InputMethodManager
 import android.webkit.CookieManager
 import android.webkit.WebChromeClient
@@ -22,9 +22,12 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -32,6 +35,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
@@ -40,7 +44,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
-import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
@@ -64,6 +67,7 @@ import org.json.JSONObject
 import org.json.JSONTokener
 import tv.vega.tv.data.providers.COMMON_USER_AGENT
 import tv.vega.tv.data.providers.WafCoordinator
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.roundToInt
 
@@ -179,6 +183,71 @@ private val FOCUS_TEXT_FIELD_JS = """
         return 'editable';
       }
       return 'none';
+    })()
+""".trimIndent()
+
+/**
+ * Records the page position before a tap is dispatched.
+ *
+ * A tap focuses a field, the keyboard opens, and the WebView's viewport gets
+ * shorter. Chromium answers that resize by scrolling the focused node into
+ * view — on some pages it also clamps the scroll to the top. Keeping the
+ * pre-tap position lets [REVEAL_EDITABLE_JS] put the page back exactly where
+ * the viewer left it, then move it only if the field itself is still hidden.
+ */
+private val SAVE_SCROLL_JS = """
+    (function () {
+      window.__vegaScroll = [window.scrollX || 0, window.scrollY || 0, Date.now()];
+      return 'saved';
+    })()
+""".trimIndent()
+
+/**
+ * Puts the page back after the keyboard opens.
+ *
+ * Restoring the saved scroll first is what stops the "tap a field and the page
+ * jumps to the top" bug. The field is then moved only when it is outside the
+ * shortened viewport, and only by the delta needed to centre it between the
+ * app toolbar and the keyboard. `scrollBy(0, delta)` never changes the
+ * horizontal position, so a page that was panned sideways stays there.
+ */
+private val REVEAL_EDITABLE_JS = """
+    (function () {
+      function resolve(el) {
+        var guard = 0;
+        while (el && el.shadowRoot && el.shadowRoot.activeElement && guard++ < 8) {
+          el = el.shadowRoot.activeElement;
+        }
+        return el;
+      }
+      function editable(el) {
+        if (!el) return false;
+        var tag = (el.tagName || '').toLowerCase();
+        if (tag === 'textarea') return true;
+        if (tag === 'input') {
+          var type = (el.getAttribute('type') || 'text').toLowerCase();
+          return ['button','submit','reset','checkbox','radio','file','image','hidden','range','color']
+            .indexOf(type) < 0;
+        }
+        return !!(el.isContentEditable || el.getAttribute('contenteditable') === 'true');
+      }
+      var saved = window.__vegaScroll;
+      window.__vegaScroll = null;
+      var active = resolve(document.activeElement);
+      if (!editable(active)) return 'none';
+      if (saved && Date.now() - saved[2] < 5000 &&
+          Math.abs((window.scrollY || 0) - saved[1]) > 4) {
+        window.scrollTo(saved[0] || 0, saved[1] || 0);
+      }
+      var r = active.getBoundingClientRect();
+      var vh = window.innerHeight || document.documentElement.clientHeight || 0;
+      var pad = 16;
+      if (vh <= 0) return 'none';
+      if (r.top < pad || r.bottom > vh - pad) {
+        var delta = r.top - Math.max(pad, (vh - r.height) / 2);
+        window.scrollBy(0, delta);
+      }
+      return 'revealed';
     })()
 """.trimIndent()
 
@@ -379,12 +448,6 @@ private val SPATIAL_NAV_JS = """
     })()
 """.trimIndent()
 
-private fun Context.findActivity(): Activity? = when (this) {
-    is Activity -> this
-    is ContextWrapper -> baseContext.findActivity()
-    else -> null
-}
-
 private fun WebView.showIme() {
     isFocusable = true
     isFocusableInTouchMode = true
@@ -396,10 +459,22 @@ private fun WebView.showIme() {
     }, 120)
 }
 
-private fun WebView.imeVisible(): Boolean =
-    runCatching {
+private fun WebView.imeVisible(): Boolean {
+    val reported = runCatching {
         ViewCompat.getRootWindowInsets(this)?.isVisible(WindowInsetsCompat.Type.ime()) == true
     }.getOrDefault(false)
+    if (reported) return true
+    // API 29 and below (and some TV firmware) do not report the IME inset.
+    // The visible display frame still shrinks for the keyboard, so use the
+    // same 15% heuristic the platform itself uses to tell a keyboard from a
+    // small system bar.
+    return runCatching {
+        val frame = Rect()
+        getWindowVisibleDisplayFrame(frame)
+        val height = rootView.height
+        height > 0 && height - frame.bottom > height * 0.15f
+    }.getOrDefault(false)
+}
 
 private fun parseCookieHeader(header: String): Map<String, String> =
     header.split(';')
@@ -446,9 +521,15 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
     // until they find the toolbar toggle. Page mode is one press away for form
     // navigation and the keyboard hand-off.
     var mode by remember { mutableStateOf(NavMode.Pointer) }
-    // True while a toolbar button owns the D-pad. Pointer movement must yield
-    // to it, or the toolbar would be unreachable with the remote.
-    val toolbarFocused = remember { mutableStateOf(false) }
+    // True from the moment a text field asks for the keyboard until BACK (or
+    // the system) closes it. While true the pointer and both key paths suspend,
+    // because the remote belongs to the IME: moving the cursor with every
+    // letter would make typing impossible.
+    var editing by remember { mutableStateOf(false) }
+    // Set when we close the keyboard ourselves. The IME can stay visible for
+    // a frame or two after hideSoftInput; without this the observer below
+    // would immediately re-adopt it and hide the cursor again.
+    val imeSuppressedUntil = remember { AtomicLong(0L) }
     val toolbarFocus = remember { FocusRequester() }
     val webViewFocus = remember { FocusRequester() }
     // Pointer keys arrive on the WebView's key listener (the page always keeps
@@ -458,7 +539,13 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
     // The JS bridge runs on a binder thread; it can only hand work back to the
     // main thread through these stable hooks.
     val focusToolbarAction = remember { AtomicReference<() -> Unit>({}) }
-    focusToolbarAction.set { runCatching { toolbarFocus.requestFocus() } }
+    focusToolbarAction.set {
+        runCatching { toolbarFocus.requestFocus() }
+        // The toolbar owns the D-pad now; leaving the native cursor over the
+        // page would suggest it still does. DOWN (handled on the Column) or
+        // BACK puts it back exactly where it was.
+        pointerOverlay?.visibility = View.GONE
+    }
 
     val density = LocalDensity.current
     val pointerStep = with(density) { 18.dp.toPx() }
@@ -500,22 +587,51 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
         onClose()
     }
 
-    fun hideImeIfVisible(): Boolean {
-        val wv = webView ?: return false
-        if (!wv.imeVisible()) return false
+    /**
+     * Hands the remote to the IME. Every path that opens the page keyboard
+     * comes through here: the tap probe, the toolbar's Keyboard button, and the
+     * page's own `__wafKeyboard` bridge message. Centralising it is what makes
+     * the cursor suspend consistently instead of only on the tap path.
+     */
+    fun beginEditing(wv: WebView) {
+        editing = true
+        pointerOverlay?.visibility = View.GONE
+        wv.showIme()
+        status = "Keyboard open — type, then press BACK to close it"
+    }
+
+    /**
+     * Closes the keyboard and hands the page back. The cursor is restored only
+     * in pointer mode: page mode has no cursor, and returning the D-pad to the
+     * page's spatial navigation is the right "done typing" state there.
+     */
+    fun endEditing() {
+        editing = false
+        imeSuppressedUntil.set(SystemClock.uptimeMillis() + 1_200)
+        val wv = webView ?: return
         val imm = wv.context.getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
         imm?.hideSoftInputFromWindow(wv.windowToken, 0)
         ViewCompat.getWindowInsetsController(wv)?.hide(WindowInsetsCompat.Type.ime())
         wv.requestFocus()
-        return true
+        if (mode == NavMode.Pointer) {
+            if (wv.width > 0 && wv.height > 0 && (cursorX < 0f || cursorY < 0f)) {
+                cursorX = wv.width / 2f
+                cursorY = wv.height / 2f
+            }
+            if (cursorX >= 0f && cursorY >= 0f) {
+                pointerOverlay?.showAt(cursorX, cursorY)
+            }
+            status = "Keyboard closed — cursor restored"
+        } else {
+            status = "Keyboard closed — page mode"
+        }
     }
 
     fun requestKeyboardIfEditable(wv: WebView) {
         runCatching {
             wv.evaluateJavascript(ACTIVE_TEXT_FIELD_JS) { result ->
                 if (result?.contains("editable") == true) {
-                    wv.showIme()
-                    status = "Keyboard open — type, then press BACK to close it"
+                    beginEditing(wv)
                 }
             }
         }
@@ -527,8 +643,7 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
         runCatching {
             wv.evaluateJavascript(FOCUS_TEXT_FIELD_JS) { result ->
                 if (result?.contains("editable") == true) {
-                    wv.showIme()
-                    status = "Keyboard open — type, then press BACK to close it"
+                    beginEditing(wv)
                 } else {
                     status = "No text field found — use Pointer mode"
                 }
@@ -539,6 +654,10 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
     fun tapWebView(x: Float, y: Float) {
         val wv = webView ?: return
         if (wv.width <= 0 || wv.height <= 0) return
+        // Save the position before the tap can focus a field. The keyboard
+        // resize is what makes some pages jump to the top; REVEAL_EDITABLE_JS
+        // restores this exact position once the IME is up.
+        runCatching { wv.evaluateJavascript(SAVE_SCROLL_JS, null) }
         val px = x.coerceIn(0f, (wv.width - 1).toFloat())
         val py = y.coerceIn(0f, (wv.height - 1).toFloat())
         val downTime = SystemClock.uptimeMillis()
@@ -555,6 +674,9 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
     }
 
     fun movePointer(dx: Float, dy: Float, step: Float) {
+        // A key repeat can arrive one frame after beginEditing set the state;
+        // never let it paint the cursor back over the keyboard.
+        if (editing) return
         val maxX = (areaWidth - 1).coerceAtLeast(0).toFloat()
         val maxY = (areaHeight - 1).coerceAtLeast(0).toFloat()
         val wv = webView
@@ -592,7 +714,14 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
         return when (keyCode) {
             AndroidKeyEvent.KEYCODE_DPAD_LEFT -> { movePointer(-1f, 0f, step); true }
             AndroidKeyEvent.KEYCODE_DPAD_RIGHT -> { movePointer(1f, 0f, step); true }
-            AndroidKeyEvent.KEYCODE_DPAD_UP -> { movePointer(0f, -1f, step); true }
+            AndroidKeyEvent.KEYCODE_DPAD_UP -> {
+                // The cursor has reached the top: the next UP step belongs to
+                // the toolbar, which is the only UI above the page. Moving
+                // focus instead of scrolling is what makes it reachable.
+                if (cursorY <= 0f) focusToolbarAction.get().invoke()
+                else movePointer(0f, -1f, step)
+                true
+            }
             AndroidKeyEvent.KEYCODE_DPAD_DOWN -> { movePointer(0f, 1f, step); true }
             AndroidKeyEvent.KEYCODE_DPAD_CENTER,
             AndroidKeyEvent.KEYCODE_ENTER,
@@ -604,7 +733,7 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
     }
 
     pointerKeyAction.set { keyCode, repeatCount ->
-        mode == NavMode.Pointer && handlePointerKeyCode(keyCode, repeatCount)
+        !editing && mode == NavMode.Pointer && handlePointerKeyCode(keyCode, repeatCount)
     }
 
     /**
@@ -616,24 +745,37 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
      * is exactly what should handle the D-pad. Forwarding here works in every
      * focus state and keeps Compose from moving focus behind the browser.
      *
-     * The toolbar always yields: while one of its buttons is focused the
-     * remote must navigate those buttons, not the page underneath.
+     * Two gates decide ownership:
+     *  - `editing`: the IME owns the remote, so nothing here may consume it.
+     *  - `!webView.hasFocus()`: a toolbar button owns the remote. The check
+     *    must be on the WebView, not on the toolbar Row: a Row is not a focus
+     *    target, so its `onFocusChanged` never reports a focused descendant.
      */
     fun handleWafKey(event: AndroidKeyEvent): Boolean {
         val down = event.action == AndroidKeyEvent.ACTION_DOWN
         if (event.keyCode == AndroidKeyEvent.KEYCODE_MENU ||
             event.keyCode == AndroidKeyEvent.KEYCODE_BUTTON_Y
         ) {
-            if (down) focusToolbarAction.get().invoke()
+            if (down) {
+                // MENU is the escape hatch from a form: close the keyboard
+                // first, otherwise the toolbar would be focused underneath it.
+                if (editing) endEditing()
+                focusToolbarAction.get().invoke()
+            }
             return true
         }
-        // While the keyboard is open the D-pad belongs to the IME.
-        if (webView?.imeVisible() == true) return false
-        if (toolbarFocused.value) return false
+        // While the keyboard is open the D-pad belongs to the IME. This is the
+        // gate the old code lacked: it only looked at the IME inset, and the
+        // focused WebView's key listener kept moving the cursor underneath.
+        if (editing) return false
+        val wv = webView ?: return false
+        // The observer polls; this covers the few hundred milliseconds before
+        // it notices a keyboard that the page opened by itself.
+        if (wv.imeVisible()) return false
+        if (!wv.hasFocus()) return false
         if (mode == NavMode.Pointer) {
             return down && handlePointerKeyCode(event.keyCode, event.repeatCount)
         }
-        val wv = webView ?: return false
         return when (event.keyCode) {
             AndroidKeyEvent.KEYCODE_DPAD_LEFT,
             AndroidKeyEvent.KEYCODE_DPAD_RIGHT,
@@ -657,6 +799,7 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
 
     /** Force the cursor to the centre after a toolbar round trip. */
     fun recenterPointer() {
+        if (editing) return
         val wv = webView ?: return
         if (wv.width <= 0 || wv.height <= 0) return
         cursorX = wv.width / 2f
@@ -665,6 +808,63 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
             pointerOverlay?.showAt(cursorX, cursorY)
         }
         wv.requestFocus()
+    }
+
+    /** Gives the page its remote back after the toolbar had it. */
+    fun returnToPage() {
+        val wv = webView ?: return
+        runCatching { wv.requestFocus() }
+        if (mode == NavMode.Pointer) {
+            if (wv.width > 0 && wv.height > 0 && (cursorX < 0f || cursorY < 0f)) {
+                cursorX = wv.width / 2f
+                cursorY = wv.height / 2f
+            }
+            if (cursorX >= 0f && cursorY >= 0f) {
+                pointerOverlay?.showAt(cursorX, cursorY)
+            }
+            status = "Cursor active — point and press OK"
+        } else {
+            status = "Page mode — D-pad moves between controls"
+        }
+    }
+
+    /**
+     * BACK arbitration for the challenge browser. Returning false means "the
+     * browser has nothing left to close", and the activity dismisses the
+     * challenge exactly as it did before.
+     *
+     * Order matters: the keyboard first (it visually covers the page), then a
+     * focused toolbar button (it is an overlay, not a page state), then pointer
+     * mode, then real browser history.
+     */
+    fun handleScreenBack(): Boolean {
+        val wv = webView
+        if (editing || wv?.imeVisible() == true) {
+            endEditing()
+            return true
+        }
+        if (wv != null && !wv.hasFocus()) {
+            returnToPage()
+            return true
+        }
+        if (mode == NavMode.Pointer) {
+            mode = NavMode.Page
+            pointerOverlay?.visibility = View.GONE
+            status = "Page mode — D-pad moves between controls"
+            return true
+        }
+        if (wv != null && wv.canGoBack()) {
+            wv.goBack()
+            return true
+        }
+        return false
+    }
+
+    val latestWafBack = rememberUpdatedState<() -> Boolean>({ handleScreenBack() })
+    DisposableEffect(Unit) {
+        val handler: () -> Boolean = { latestWafBack.value() }
+        WafKeyBus.onBack = handler
+        onDispose { if (WafKeyBus.onBack === handler) WafKeyBus.onBack = null }
     }
 
     /**
@@ -727,16 +927,90 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
         }
     }
 
-    // Keep the window its own size while the IME is up. Resizing it on every
-    // keyboard toggle reflows the whole page and is a visible stutter on TV.
+    // The manifest requests adjustResize; edge-to-edge keeps the window its own
+    // size and reports the keyboard as an inset, which `imePadding()` consumes.
+    // API 29 and some TV firmware do not report that inset, so the layout
+    // observer keeps the visible-display-frame height as a fallback. It is
+    // applied only when the real inset is 0 — never both, or the page would be
+    // padded twice and the field would float above the toolbar for no reason.
     val localView = LocalView.current
+    var legacyImePx by remember { mutableIntStateOf(0) }
     DisposableEffect(localView) {
-        val window = localView.context.findActivity()?.window
-        val previous = window?.attributes?.softInputMode
-        window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING)
+        val observer = ViewTreeObserver.OnGlobalLayoutListener {
+            val frame = Rect()
+            localView.getWindowVisibleDisplayFrame(frame)
+            val height = localView.rootView.height
+            legacyImePx = if (height > 0 && height - frame.bottom > height * 0.15f) {
+                height - frame.bottom
+            } else {
+                0
+            }
+        }
+        localView.viewTreeObserver.addOnGlobalLayoutListener(observer)
         onDispose {
-            previous?.let { window?.setSoftInputMode(it) }
+            runCatching { localView.viewTreeObserver.removeOnGlobalLayoutListener(observer) }
             runCatching { CookieManager.getInstance().flush() }
+        }
+    }
+    val imeBottomPx = WindowInsets.ime.getBottom(density)
+    // The visible-frame estimate is only a pre-30 fallback: on 30+ the real
+    // inset is authoritative, and mixing the two during the close animation
+    // would add a frame of phantom padding as one reaches zero before the
+    // other.
+    val manualImePx =
+        if (Build.VERSION.SDK_INT >= 30 || imeBottomPx > 0) 0 else legacyImePx
+
+    // The IME opens at its own pace and the WebView height settles over
+    // several frames. A short series of passes covers a fast phone keyboard
+    // and a slow TV one; each pass is a no-op once the field is visible.
+    LaunchedEffect(editing, webView) {
+        val wv = webView ?: return@LaunchedEffect
+        if (!editing) return@LaunchedEffect
+        repeat(4) {
+            delay(350)
+            if (!editing) return@LaunchedEffect
+            wv.evaluateJavascript(REVEAL_EDITABLE_JS, null)
+        }
+    }
+
+    // The keyboard is not only opened by our tap probe: a page can focus a
+    // field itself on load, and some firmwares keep the IME up for a moment
+    // after BACK. One observer handles both directions:
+    //  - an IME that appears without beginEditing is adopted, so the cursor
+    //    and the remote stop at once;
+    //  - an IME that disappears (system dismissal, BACK swallowed by the IME
+    //    window) ends editing after ~0.6s, while one that never appears gets
+    //    the full ~2.4s grace.
+    LaunchedEffect(webView) {
+        val wv = webView ?: return@LaunchedEffect
+        var hiddenChecks = 0
+        var sawIme = false
+        while (true) {
+            delay(300)
+            val visible = wv.imeVisible()
+            if (visible) {
+                if (!editing && SystemClock.uptimeMillis() > imeSuppressedUntil.get()) {
+                    editing = true
+                    pointerOverlay?.visibility = View.GONE
+                    status = "Keyboard open — type, then press BACK to close it"
+                }
+                sawIme = true
+                hiddenChecks = 0
+            } else if (editing) {
+                if (sawIme) {
+                    if (++hiddenChecks >= 2) {
+                        endEditing()
+                        hiddenChecks = 0
+                        sawIme = false
+                    }
+                } else if (++hiddenChecks >= 8) {
+                    endEditing()
+                    hiddenChecks = 0
+                }
+            } else {
+                hiddenChecks = 0
+                sawIme = false
+            }
         }
     }
 
@@ -749,9 +1023,9 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
     // Page mode and pointer mode both keep real focus on the WebView: pointer
     // keys are intercepted by its key listener, and a Compose focus target
     // cannot be trusted to stay above a native WebView.
-    LaunchedEffect(pendingId, webView, mode) {
+    LaunchedEffect(pendingId, webView, mode, editing) {
         val wv = webView ?: return@LaunchedEffect
-        if (mode == NavMode.Pointer) {
+        if (mode == NavMode.Pointer && !editing) {
             // Width is 0 until the WebView is laid out; leaving the cursor
             // unset (-1) lets the size callback centre it, instead of pinning
             // it to the top-left corner of the page.
@@ -772,20 +1046,6 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
         }
     }
 
-    DisposableEffectBackHandler {
-        when {
-            // BACK from the toolbar returns to the page instead of turning
-            // pointer mode off or closing the browser.
-            toolbarFocused.value && webView != null -> webView?.requestFocus()
-            // The keyboard owns the first BACK.
-            hideImeIfVisible() -> Unit
-            mode == NavMode.Pointer -> mode = NavMode.Page
-            // A login flow is a browser: BACK follows its redirects first.
-            webView?.canGoBack() == true -> webView?.goBack()
-            else -> close()
-        }
-    }
-
     LaunchedEffect(pendingId) {
         done = false
         bridgeSettled.set(false)
@@ -802,28 +1062,34 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
     }
 
     Column(
-        Modifier.fillMaxSize().onPreviewKeyEvent { event ->
-            // Moving down from the toolbar enters the page. Keys inside the
-            // WebView never reach Compose, which is exactly what we want.
-            if (event.type == KeyEventType.KeyDown && event.key == Key.DirectionDown) {
-                val wv = webView
-                if (wv != null && !wv.hasFocus()) {
-                    runCatching { wv.requestFocus() }
-                    true
+        Modifier
+            .fillMaxSize()
+            .imePadding()
+            .padding(bottom = with(density) { manualImePx.toDp() })
+            .onPreviewKeyEvent { event ->
+                // Moving down from the toolbar enters the page. Keys inside
+                // the WebView never reach Compose, which is what we want.
+                if (event.type == KeyEventType.KeyDown &&
+                    event.key == Key.DirectionDown &&
+                    !editing
+                ) {
+                    val wv = webView
+                    if (wv != null && !wv.hasFocus()) {
+                        returnToPage()
+                        true
+                    } else {
+                        false
+                    }
                 } else {
                     false
                 }
-            } else {
-                false
-            }
-        },
+            },
     ) {
         Row(
             Modifier
                 .fillMaxWidth()
                 .height(56.dp)
-                .padding(horizontal = 12.dp)
-                .onFocusChanged { toolbarFocused.value = it.hasFocus },
+                .padding(horizontal = 12.dp),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
@@ -873,10 +1139,12 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
             Button(onClick = { close() }) { Text("Close", maxLines = 1) }
         }
         Text(
-            if (mode == NavMode.Page) {
-                "D-pad navigates · OK selects · UP at the top opens the toolbar · BACK goes back"
-            } else {
-                "D-pad moves the cursor · OK taps · MENU for the toolbar · BACK switches to page mode"
+            when {
+                editing -> "Keyboard open · type · BACK closes the keyboard"
+                mode == NavMode.Page ->
+                    "D-pad navigates · OK selects · UP at the top opens the toolbar · BACK goes back"
+                else ->
+                    "D-pad moves the cursor · OK taps · UP at the top or MENU opens the toolbar · BACK switches to page mode"
             },
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -894,7 +1162,7 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
                     cursorX = cursorX.coerceIn(0f, (size.width - 1).coerceAtLeast(0).toFloat())
                     cursorY = cursorY.coerceIn(0f, (size.height - 1).coerceAtLeast(0).toFloat())
                 }
-                if (mode == NavMode.Pointer) {
+                if (mode == NavMode.Pointer && !editing) {
                     if (cursorX >= 0f && cursorY >= 0f) {
                         pointerOverlay?.showAt(cursorX, cursorY)
                     }
@@ -919,6 +1187,11 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
                             isFocusable = true
                             isFocusableInTouchMode = true
                             setOnKeyListener { _, keyCode, event ->
+                                // The IME owns every key while the on-screen
+                                // keyboard is up. Without this the WebView's
+                                // listener moved the cursor under the keyboard
+                                // even though the activity hook had declined.
+                                if (editing || imeVisible()) return@setOnKeyListener false
                                 if (event.action == AndroidKeyEvent.ACTION_DOWN &&
                                     pointerKeyAction.get().invoke(keyCode, event.repeatCount)
                                 ) {
@@ -964,12 +1237,17 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
                                 // what keeps the session alive across it.
                                 cm.setAcceptThirdPartyCookies(this, true)
                             }
+                            val self = this
                             addJavascriptInterface(object {
                                 @android.webkit.JavascriptInterface
                                 fun postMessage(message: String) {
                                     val obj = runCatching { JSONObject(message) }.getOrNull() ?: return
                                     if (obj.optBoolean("__wafKeyboard")) {
-                                        post { showIme() }
+                                        // Page navigation found a text field.
+                                        // Go through beginEditing so the
+                                        // cursor suspends here too, not only
+                                        // on the tap path.
+                                        post { beginEditing(self) }
                                         return
                                     }
                                     if (obj.optString("__wafNav").equals("up", true)) {
@@ -1027,7 +1305,7 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
                                     // A new document must not leave the pointer
                                     // hidden: the overlay is native and outlives
                                     // every page load.
-                                    if (mode == NavMode.Pointer) {
+                                    if (mode == NavMode.Pointer && !editing) {
                                         if (view != null && view.width > 0 && view.height > 0 &&
                                             (cursorX < 0f || cursorY < 0f)
                                         ) {
@@ -1149,29 +1427,5 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
         if (!done) {
             status = "Timed out — press Close and retry"
         }
-    }
-}
-
-/** BACK must dismiss a pending provider challenge, not orphan it. */
-@Composable
-private fun DisposableEffectBackHandler(onBack: () -> Unit) {
-    val view = LocalView.current
-    val currentOnBack by rememberUpdatedState(onBack)
-    DisposableEffect(view) {
-        // Key events, not the activity back dispatcher: a TV remote's BACK is a
-        // real key event, and a provider-suspended challenge must be answered
-        // on both paths. `focused` is checked because an unhandled BACK on a
-        // TV box is delivered to the launcher otherwise.
-        val listener = view.setOnKeyListener { _, keyCode, event ->
-            if (keyCode == AndroidKeyEvent.KEYCODE_BACK &&
-                event.action == AndroidKeyEvent.ACTION_UP
-            ) {
-                currentOnBack()
-                true
-            } else {
-                false
-            }
-        }
-        onDispose { view.setOnKeyListener(null) }
     }
 }

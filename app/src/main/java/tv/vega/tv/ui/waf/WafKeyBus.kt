@@ -13,9 +13,18 @@ import android.view.KeyEvent
  * the browser's key handling here makes the cursor and the page behave the same
  * in every focus state.
  *
- * The handler must return true only for keys it actually consumed, so BACK and
- * anything the toolbar owns still reach normal navigation.
+ * [onKey] must return true only for keys it actually consumed, so BACK and
+ * anything the toolbar owns still reach normal navigation. [onBack] is the one
+ * other key the browser has to arbitrate: while a page keyboard is open the
+ * first BACK closes it, and the browser must keep the challenge on screen.
  */
 object WafKeyBus {
     var onKey: ((KeyEvent) -> Boolean)? = null
+
+    /**
+     * Handles BACK inside the challenge. Returns true when the browser used it
+     * (keyboard closed, toolbar left, page went back, pointer mode left), and
+     * false when the activity should dismiss the challenge as usual.
+     */
+    var onBack: (() -> Boolean)? = null
 }

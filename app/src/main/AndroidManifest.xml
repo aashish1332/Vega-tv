@@ -35,7 +35,8 @@
             android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize|screenLayout"
             android:launchMode="singleTask"
             android:screenOrientation="landscape"
-            android:theme="@style/Theme.VegaTV">
+            android:theme="@style/Theme.VegaTV"
+            android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <!-- Show on the Android TV home screen -->

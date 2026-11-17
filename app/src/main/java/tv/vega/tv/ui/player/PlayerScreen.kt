@@ -1,5 +1,7 @@
 package tv.vega.tv.ui.player
 
+import android.app.ActivityManager
+import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.util.Log
@@ -160,6 +162,29 @@ private data class SeekOsd(
 private class SeekCoalescer {
     var pendingMs = 0L
     var job: Job? = null
+}
+
+/**
+ * Forward-buffer budget in bytes for this device.
+ *
+ * A fixed cap cannot serve both a 2 GB TV stick and a 4K box. The old fixed
+ * 64 MB was only ~6 s at 80 Mbps, and a 5 s back buffer took most of it (see
+ * the load control below), so a large 4K HDR file had almost no forward
+ * cushion and rebuffered continuously. The official client instead sizes the
+ * buffers from the device: at most 35% of the app heap and 1/32 of total RAM.
+ * Keep the old 64 MB as the floor so no device gets a smaller buffer than
+ * 1.1.3, and cap the result at 256 MB — enough for ~20 s of a 100 Mbps remux
+ * while still a fraction of the heap on the boxes that can afford it.
+ */
+private fun mediaBufferBudgetBytes(ctx: Context): Int {
+    val heap = Runtime.getRuntime().maxMemory()
+    val info = ActivityManager.MemoryInfo()
+    (ctx.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager)
+        ?.getMemoryInfo(info)
+    // totalMem can be 0 on very old APIs; the heap is then the only bound.
+    val totalRam = if (info.totalMem > 0) info.totalMem else heap * 8
+    val safe = minOf((heap * 0.35).toLong(), totalRam / 32)
+    return minOf(maxOf(64L * 1024 * 1024, safe), 256L * 1024 * 1024).toInt()
 }
 
 /**
@@ -414,19 +439,28 @@ fun PlayerScreen(
                     // 256 KB chunks: at 4K bitrates the 64 KB default churned
                     // thousands of small allocations per minute.
                     .setAllocator(DefaultAllocator(true, 256 * 1024))
-                    // Hard Java-heap ceiling. Without it the time-only window
-                    // buffered up to 20s — 150-250 MB on a 60-100 Mbps 4K
-                    // file, the seek-on-a-huge-file OOM that restarts weak TV
-                    // boxes. 64 MB ≈ 8s at 60 Mbps / 30s time-cap at 15 Mbps.
-                    .setTargetBufferBytes(64 * 1024 * 1024)
-                    // min 15s, max 60s, start at 2s, resume-after-rebuffer 5s.
-                    // The old 30s ceiling ran dry during a CDN/CDN-switch
-                    // hiccup on long films; 60s gives the retry policy room
-                    // while the 64 MB cap still bounds memory on low-bitrate
-                    // streams (≈4.5 min at 2 Mbps, ≈8s at 60 Mbps).
-                    .setBufferDurationsMs(15_000, 60_000, 2_000, 5_000)
-                    // A ±5s rewind replays from RAM instead of re-fetching.
-                    .setBackBuffer(5_000, false)
+                    // Heap/RAM-sized forward budget instead of a fixed 64 MB.
+                    // On a 2 GB TV this still resolves to ~64 MB; on a box
+                    // with a larger heap it buys the extra seconds a 4K HDR
+                    // remux needs. Never smaller than 1.1.3.
+                    .setTargetBufferBytes(mediaBufferBudgetBytes(ctx))
+                    // min 15s, max 60s, start at 1.5s, resume after a rebuffer
+                    // at 3s. The old 5s resume threshold was harsher than the
+                    // official client's 3s and, at 100 Mbps, required 62 MB —
+                    // the whole 64 MB budget — just to show a frame again.
+                    // 3s resumes in 40% less data and still keeps the stream
+                    // comfortably ahead on the enlarged budget.
+                    .setBufferDurationsMs(15_000, 60_000, 1_500, 3_000)
+                    // No back buffer. ExoPlayer keeps it in the same allocator
+                    // as the forward buffer, and its cost is pure bitrate:
+                    // 5s is 37 MB at 60 Mbps and 62 MB at 100 Mbps. That ate
+                    // the 64 MB budget, leaving 1–3s of forward media; the
+                    // player drained it, rebuffered, and ExoPlayer then threw
+                    // the back buffer away to unblock loading. A rewind now
+                    // re-fetches a range from the server instead of starving
+                    // a 4K HDR stream. This matches the official client's
+                    // default of no back buffer.
+                    .setBackBuffer(0, false)
                     .build(),
             )
             .build()
