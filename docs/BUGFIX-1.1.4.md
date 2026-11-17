@@ -35,4 +35,15 @@ Status: [ ] pending · [~] in progress · [x] fixed & compile-verified · [B] ve
      play with a ~5 s cushion on a 2 GB box and more on a larger-heap box, with a
      rewind re-fetching from the server instead of replaying from RAM.
 
-3. [ ] Build 1.1.4 APK, verify, commit, push, release.
+3. [x] Build 1.1.4 APK, verify, commit, push, release.
+   - `versionCode 6` / `versionName "1.1.4"`; `assembleDebug` clean.
+   - APK `app-debug.apk`, 23,640,713 bytes, SHA-256
+     `F45FA44D49E6A71C5B24BB30DF7810BB99CE61F4B1D8E62E76CC2C700B479DD0`,
+     signed with the same debug certificate as 1.1.3
+     (`5595d8d0…b22252`), so it installs over it.
+   - `aapt` confirms `versionCode='6' versionName='1.1.4'`, minSdk 21, targetSdk 34.
+   - Commit `47c2e02`, tag `v1.1.4`, release
+     https://github.com/aashish1332/Vega-tv/releases/tag/v1.1.4 with the APK.
+   - Still needs the user's device test for the two items above; no Android
+     device/emulator was attached here, so runtime feel and network behaviour
+     could not be measured locally.
