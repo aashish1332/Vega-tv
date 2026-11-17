@@ -10,7 +10,9 @@ import kotlinx.coroutines.launch
 import tv.vega.tv.data.ServiceLocator
 import tv.vega.tv.data.model.VegaStream
 import tv.vega.tv.data.model.identityKey
+import tv.vega.tv.data.providers.readableProviderError
 import tv.vega.tv.player.PlaybackSession
+import tv.vega.tv.player.drmUnsupportedReason
 import tv.vega.tv.ui.common.UiState
 
 class PlayerViewModel : ViewModel() {
@@ -265,19 +267,32 @@ class PlayerViewModel : ViewModel() {
                 _nextError.value = null
                 _switching.value = null
                 val preferredIndex = streams.indexOfFirst {
-                    it.identityKey() == PlaybackSession.preferredStreamKey
+                    it.identityKey() == PlaybackSession.preferredStreamKey &&
+                        it.drmUnsupportedReason() == null
                 }
                 when {
                     streams.isEmpty() -> autoSelect(0)
                     userPicked -> index = index.coerceIn(0, streams.lastIndex)
                     preferredIndex >= 0 -> autoSelect(preferredIndex)
                     preferBest -> {
-                        // After ordering, the Pixeldrain block is a prefix, so
-                        // an index inside it is already an index into `streams`.
-                        val pool = streams.takeWhile(::isPixeldrain).ifEmpty { streams }
-                        autoSelect(bestIndexForDisplay(pool, maxPlaybackHeight))
+                        // Skip renditions whose DRM this device cannot open: an
+                        // unsupported DRM server must never win the automatic
+                        // pick and dead-end playback.
+                        autoSelect(bestPlayableIndex(streams, maxPlaybackHeight))
                     }
-                    else -> index = index.coerceIn(0, streams.lastIndex)
+                    else -> {
+                        // "First server first" must still skip a rendition this
+                        // device cannot decrypt: it is a guaranteed black screen,
+                        // not a preference.
+                        val firstPlayable = streams.indexOfFirst {
+                            it.drmUnsupportedReason() == null
+                        }
+                        index = if (firstPlayable >= 0) {
+                            firstPlayable
+                        } else {
+                            index.coerceIn(0, streams.lastIndex)
+                        }
+                    }
                 }
                 PlaybackSession.streams = streams
                 _state.value = UiState.Success(streams)
@@ -286,7 +301,10 @@ class PlayerViewModel : ViewModel() {
                     val message = if (e is tv.vega.tv.data.providers.ProviderManager.WafRequired) {
                         "Challenge required at ${e.host.ifBlank { "provider" }}"
                     } else {
-                        e.message ?: "No streams"
+                        readableProviderError(
+                            e,
+                            fallback = "The provider could not return streams for this title. Try again.",
+                        )
                     }
                     // A resume must not dead-end because the provider API is
                     // briefly down or the saved title link expired: the direct
@@ -300,11 +318,12 @@ class PlayerViewModel : ViewModel() {
                     ) {
                         val streams = preferPixeldrain(saved)
                         val preferred = streams.indexOfFirst {
-                            it.identityKey() == PlaybackSession.preferredStreamKey
+                            it.identityKey() == PlaybackSession.preferredStreamKey &&
+                                it.drmUnsupportedReason() == null
                         }
                         autoSelect(
                             if (preferred >= 0) preferred
-                            else bestIndexForDisplay(streams, maxPlaybackHeight),
+                            else bestPlayableIndex(streams, maxPlaybackHeight),
                         )
                         PlaybackSession.streams = streams
                         _state.value = UiState.Success(streams)
@@ -560,6 +579,22 @@ internal fun bestIndexForDisplay(streams: List<VegaStream>, maxHeight: Int): Int
     if (capped >= 0) return capped
     if (above >= 0) return above
     return bestIndex(streams)
+}
+
+/**
+ * Best rendition whose DRM this device can actually open.
+ *
+ * Keeps the Pixeldrain preference and the resolution cap, but never returns an
+ * index into the unsupported block while any playable mirror exists — a DRM
+ * channel that cannot decrypt is a dead end, not a quality choice. When every
+ * rendition is unsupported the normal ranking is returned so the player can
+ * show the readable reason instead of an empty stage.
+ */
+internal fun bestPlayableIndex(streams: List<VegaStream>, maxHeight: Int): Int {
+    val playable = streams.indices.filter { streams[it].drmUnsupportedReason() == null }
+    if (playable.isEmpty()) return bestIndexForDisplay(streams, maxHeight)
+    val preferred = playable.filter { isPixeldrain(streams[it]) }.ifEmpty { playable }
+    return preferred[bestIndexForDisplay(preferred.map { streams[it] }, maxHeight)]
 }
 
 private val RES_LABEL = Regex("""\b(\d{3,4})\s?[pi]?\b""", RegexOption.IGNORE_CASE)

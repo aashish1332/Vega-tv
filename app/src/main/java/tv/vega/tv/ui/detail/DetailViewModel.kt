@@ -13,6 +13,7 @@ import kotlinx.coroutines.launch
 import tv.vega.tv.data.ServiceLocator
 import tv.vega.tv.data.model.EpisodeItem
 import tv.vega.tv.data.model.VegaInfo
+import tv.vega.tv.data.providers.readableProviderError
 import tv.vega.tv.player.PlaybackSession
 import tv.vega.tv.player.qualityScore
 import tv.vega.tv.ui.common.UiState
@@ -226,27 +227,49 @@ class DetailViewModel : ViewModel() {
                 val resolved = seasons.map { it }.toMutableList()
                 val jobs = ordered.mapIndexed { index, season ->
                     async {
-                        val raw = season.directLinks.mapIndexed { i, d ->
-                            // A rendition card with no title of its own still
-                            // has a name: the season's quality label. Without
-                            // it the card would read "Episode 1".
-                            val title = if (movie) {
-                                d.title.trim().ifBlank {
+                        // A series can carry both an `episodesLink` and
+                        // `directLinks`: the first is the episode list, the
+                        // second a set of watch/download servers. The mobile app
+                        // renders the episode list and only falls back to
+                        // directLinks when it resolved nothing — using
+                        // directLinks first turned four servers into "EP 1–4".
+                        val raw = if (movie) {
+                            season.directLinks.map { d ->
+                                // A rendition card with no title of its own still
+                                // has a name: the season's quality label. Without
+                                // it the card would read "Episode 1".
+                                val title = d.title.trim().ifBlank {
                                     season.quality?.trim().orEmpty()
                                         .ifBlank { season.title.trim() }
                                 }
-                            } else {
-                                d.title
+                                EpisodeItem(title = title, link = d.link, image = d.image)
                             }
-                            EpisodeItem(title = title, link = d.link, image = d.image, number = i + 1)
-                        }.ifEmpty {
-                            val url = season.episodesLink.orEmpty()
-                            if (url.isBlank()) emptyList()
-                            else runCatching {
-                                val pm = ServiceLocator.providers
-                                val a = pm.active() ?: return@runCatching emptyList<EpisodeItem>()
-                                pm.getEpisodes(a, url)
-                            }.getOrDefault(emptyList()).mapIndexed { i, e -> e.copy(number = i + 1) }
+                        } else {
+                            val listed = season.episodesLink
+                                ?.takeIf { it.isNotBlank() }
+                                ?.let { url ->
+                                    runCatching {
+                                        val pm = ServiceLocator.providers
+                                        val a = pm.active()
+                                            ?: return@runCatching emptyList<EpisodeItem>()
+                                        pm.getEpisodes(a, url)
+                                    }.getOrDefault(emptyList())
+                                        .filter { it.link.isNotBlank() }
+                                        .mapIndexed { i, e -> e.copy(number = i + 1) }
+                                }
+                                .orEmpty()
+                            listed.ifEmpty {
+                                // Provider link groups, in provider order. No
+                                // position number: these entries are often
+                                // server names ("HubCloud", "Mega"), and a card
+                                // that invents "EP 1" for a server is lying.
+                                // A real episode title still yields its number.
+                                season.directLinks.mapNotNull { d ->
+                                    val title = d.title.trim()
+                                    if (title.isEmpty() || d.link.isBlank()) null
+                                    else EpisodeItem(title = title, link = d.link, image = d.image)
+                                }
+                            }
                         }
                         val eps = if (movie) {
                             // Quality cards: best-first, matching the player's
@@ -302,7 +325,9 @@ class DetailViewModel : ViewModel() {
                         _wafUrl.value = e.url.ifBlank { null }
                         _state.value = UiState.Error("Challenge required at ${e.host.ifBlank { "provider" }}")
                     } else {
-                        _state.value = UiState.Error(e.message ?: "Failed to load")
+                        _state.value = UiState.Error(
+                            readableProviderError(e, fallback = "Could not load this title. Try again."),
+                        )
                     }
                 }
         }

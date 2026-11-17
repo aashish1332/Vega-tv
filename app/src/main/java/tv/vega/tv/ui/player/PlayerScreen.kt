@@ -2,6 +2,7 @@ package tv.vega.tv.ui.player
 
 import android.content.Intent
 import android.net.Uri
+import android.util.Log
 import android.view.ViewGroup
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -31,6 +32,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.AspectRatio
 import androidx.compose.material.icons.filled.Audiotrack
+import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.Forward10
 import androidx.compose.material.icons.filled.HighQuality
 import androidx.compose.material.icons.filled.Info
@@ -84,6 +86,8 @@ import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.analytics.AnalyticsListener
+import androidx.media3.exoplayer.drm.DrmSessionManager
+import androidx.media3.exoplayer.drm.DrmSessionManagerProvider
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import androidx.media3.exoplayer.upstream.DefaultAllocator
@@ -108,8 +112,12 @@ import tv.vega.tv.data.history.WatchEntry
 import tv.vega.tv.data.net.NetClients
 import tv.vega.tv.data.model.VegaStream
 import tv.vega.tv.data.model.identityKey
+import tv.vega.tv.player.MatroskaCueDataSource
 import tv.vega.tv.player.PlaybackSession
 import tv.vega.tv.player.PlayerKeyBus
+import tv.vega.tv.player.createDrmSessionManager
+import tv.vega.tv.player.drmUnsupportedReason
+import tv.vega.tv.player.playbackErrorMessage
 import tv.vega.tv.player.isMovieInfo
 import tv.vega.tv.player.qualityScore
 import tv.vega.tv.ui.common.UiState
@@ -128,8 +136,18 @@ private data class Skip(val title: String, val fromMs: Long, val toMs: Long)
 /**
  * What the seek overlay shows: direction, the accumulated step of the current
  * key burst (±10s per press, so a held key reads as ±30s), and the target time.
+ *
+ * [blocked] is the honest answer for a source ExoPlayer cannot seek (a live
+ * edge or an index-less file): the overlay says so instead of letting the seek
+ * silently restart playback at 0:00. [live] picks the wording.
  */
-private data class SeekOsd(val direction: Int, val targetMs: Long, val stepMs: Long)
+private data class SeekOsd(
+    val direction: Int,
+    val targetMs: Long,
+    val stepMs: Long,
+    val blocked: Boolean = false,
+    val live: Boolean = false,
+)
 
 /**
  * Burst-seek accumulator that survives key-handler effect restarts.
@@ -349,6 +367,23 @@ fun PlayerScreen(
                     .createDataSource()
         }
     }
+    // Matroska files whose Cues are reachable only through a chained SeekHead
+    // make Media3 report the stream as unseekable, and every seek then restarts
+    // playback at 0:00. This wrapper rewrites that one SeekEntry in flight;
+    // HLS/MP4 and every non-Matroska source pass through untouched.
+    // `treatAsMatroska` is set from the provider's declared type before prepare.
+    val matroskaHttp = remember { MatroskaCueDataSource.Factory(headerHttp) }
+    // Per-stream DRM. Media3 asks this provider once per media item; the map
+    // is written immediately before setMediaItem, so a DRM configuration can
+    // never leak from one server to the next (or to a clear stream).
+    val drmByLink = remember { java.util.concurrent.ConcurrentHashMap<String, tv.vega.tv.data.model.StreamDrm>() }
+    val drmProvider = remember {
+        DrmSessionManagerProvider { item ->
+            drmByLink[item.mediaId]
+                ?.createDrmSessionManager(headerHttp)
+                ?: DrmSessionManager.DRM_UNSUPPORTED
+        }
+    }
     // The listener outlives any single composition, so it reaches the UI
     // through this holder rather than through a state it captured. Without the
     // assignment below the listener would fire into a no-op and a 403 would
@@ -364,7 +399,11 @@ fun PlayerScreen(
         )
             .setMediaSourceFactory(
                 DefaultMediaSourceFactory(ctx)
-                    .setDataSourceFactory(headerHttp)
+                    .setDataSourceFactory(matroskaHttp)
+                    // Inline ClearKey / licence-server DRM from newer providers.
+                    // A stream with no `drm` object resolves to DRM_UNSUPPORTED
+                    // (Media3's no-DRM manager) and is unaffected.
+                    .setDrmSessionManagerProvider(drmProvider)
                     // A connection dropped while re-fetching around a seek gets
                     // a few backoff retries before the error card shows.
                     .setLoadErrorHandlingPolicy(DefaultLoadErrorHandlingPolicy(4)),
@@ -465,9 +504,10 @@ fun PlayerScreen(
                     tailFailed = true
                     return
                 }
-                val cause = error.errorCodeName + ": " +
-                    (error.cause?.message ?: error.localizedMessage ?: "unknown")
-                showError.value(cause.take(200))
+                // DRM failures and every other media failure get a sentence a
+                // viewer can act on. The raw code and cause stay in logcat.
+                Log.w("VegaPlayer", "Playback error ${error.errorCodeName}", error)
+                showError.value(playbackErrorMessage(error))
             }
 
             override fun onPlaybackStateChanged(playbackState: Int) {
@@ -574,6 +614,25 @@ fun PlayerScreen(
      * returns false and lets Compose navigate. When the controls are hidden —
      * or the scrubber is the thing focused — the arrows belong to playback.
      */
+    /**
+     * The honest overlay for a source ExoPlayer cannot seek: a live edge, a
+     * stream still preparing, or a file whose index is unusable. Without this
+     * a seek on an unseekable item silently restarts playback at 0:00.
+     */
+    fun showSeekBlocked() {
+        // Before the timeline exists there is nothing to seek, but saying
+        // "unavailable" while the first frame is still loading would be wrong.
+        if (player.playbackState != androidx.media3.common.Player.STATE_READY) return
+        seekOsd = SeekOsd(
+            direction = 0,
+            targetMs = player.currentPosition.coerceAtLeast(0L),
+            stepMs = 0,
+            blocked = true,
+            live = player.isCurrentMediaItemLive,
+        )
+        lastInteraction = System.currentTimeMillis()
+    }
+
     DisposableEffect(
         player, hasMedia, resolveError, playError, nextError,
         menuOpen, showUI, controlFocused, scrubberFocused,
@@ -582,6 +641,13 @@ fun PlayerScreen(
 
         fun seekBy(ms: Long, clampMs: Long = 10 * 60_000L): Boolean {
             if (!playing()) return false
+            // ExoPlayer answers a seek on an unseekable item by restarting at
+            // 0:00. That is the entire "seek is broken" symptom on index-less
+            // MKVs and live edges, so never send the seek at all.
+            if (!player.isCurrentMediaItemSeekable) {
+                showSeekBlocked()
+                return true
+            }
             // TV remotes emit repeated key events in bursts. Coalesce them so
             // the decoder performs one seek instead of thrashing on every key.
             // The accumulator lives in `seekCoalescer` (remember-scoped), not
@@ -1012,7 +1078,8 @@ fun PlayerScreen(
                 val candidate = streams[i]
                 candidate.link.isNotBlank() &&
                     candidate.link != currentLink &&
-                    candidate.link !in failed
+                    candidate.link !in failed &&
+                    candidate.drmUnsupportedReason() == null
             }
         if (next == null) {
             failoverLabel = null
@@ -1066,7 +1133,9 @@ fun PlayerScreen(
     LaunchedEffect(sel?.link) {
         val cur = sel ?: return@LaunchedEffect
         val ext = ServiceLocator.settings.useExternalPlayer.first()
-        if (ext && cur.link.isNotBlank()) {
+        // An external player receives only a URL: inline ClearKey and licence
+        // endpoints cannot travel with it, so DRM streams stay in the app.
+        if (ext && cur.link.isNotBlank() && cur.drm == null) {
             openExternal(ctx, cur)
             onBack()
         }
@@ -1080,8 +1149,25 @@ fun PlayerScreen(
     LaunchedEffect(sel?.link, sel?.headers, subsRev, mediaRev) {
         val cur = sel ?: return@LaunchedEffect
         if (cur.link.isBlank()) return@LaunchedEffect
+        // Never hand an unplayable DRM configuration to ExoPlayer: a raw
+        // ERROR_CODE_DRM_SCHEME_UNSUPPORTED card is what made DRM-only live
+        // channels look like a player crash. The card above offers the server
+        // list, and a clear mirror (if any) is one press away.
+        cur.drmUnsupportedReason()?.let { reason ->
+            PlaybackSession.resumePositionMs = 0L
+            playError = reason
+            showUI = true
+            touch()
+            return@LaunchedEffect
+        }
         runCatching {
             dataSourceWith(cur.headers)
+            // The wrapper probes only what the provider declares as Matroska
+            // (or a URL that plainly names an .mkv). HLS and MP4 keep the
+            // direct, zero-overhead data path.
+            matroskaHttp.treatAsMatroska = cur.type.contains("mkv", ignoreCase = true)
+            drmByLink.clear()
+            cur.drm?.let { drmByLink[cur.link] = it }
             val keep = if (player.playbackState == androidx.media3.common.Player.STATE_IDLE) {
                 PlaybackSession.resumePositionMs.also { PlaybackSession.resumePositionMs = 0L }
             } else player.currentPosition
@@ -1218,12 +1304,17 @@ fun PlayerScreen(
             touch()
         },
         onSeekBy = { ms ->
-            val d = player.duration
-            val target = (player.currentPosition + ms)
-                .coerceIn(0L, if (d > 0) d else Long.MAX_VALUE)
-            player.seekTo(target)
-            seekOsd = SeekOsd(if (ms < 0) -1 else 1, target, ms)
-            touch()
+            if (player.isCurrentMediaItemSeekable) {
+                val d = player.duration
+                val target = (player.currentPosition + ms)
+                    .coerceIn(0L, if (d > 0) d else Long.MAX_VALUE)
+                player.seekTo(target)
+                seekOsd = SeekOsd(if (ms < 0) -1 else 1, target, ms)
+                touch()
+            } else {
+                showSeekBlocked()
+                touch()
+            }
         },
         onSeekOsd = seekOsd,
         onNext = { vm.next(); touch() },
@@ -2273,26 +2364,43 @@ private fun SeekOsdBadge(osd: SeekOsd, modifier: Modifier = Modifier) {
             .padding(horizontal = 20.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Icon(
-            if (osd.direction < 0) Icons.Filled.Replay10 else Icons.Filled.Forward10,
-            contentDescription = null,
-            tint = VegaPrimary,
-            modifier = Modifier.size(24.dp),
-        )
-        Spacer(Modifier.width(10.dp))
-        Text(
-            "${if (osd.direction < 0) "-" else "+"}${kotlin.math.abs(osd.stepMs) / 1000}s",
-            style = MaterialTheme.typography.titleMedium,
-            fontWeight = FontWeight.Bold,
-            color = Color.White,
-        )
-        Spacer(Modifier.width(14.dp))
-        Text(
-            fmtMs(osd.targetMs),
-            style = MaterialTheme.typography.titleMedium,
-            fontWeight = FontWeight.Bold,
-            color = VegaPrimary,
-        )
+        if (osd.blocked) {
+            Icon(
+                Icons.Filled.Block,
+                contentDescription = null,
+                tint = VegaPrimary,
+                modifier = Modifier.size(24.dp),
+            )
+            Spacer(Modifier.width(10.dp))
+            Text(
+                if (osd.live) "Live stream — seeking is unavailable"
+                else "Seeking is unavailable for this stream",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+                color = Color.White,
+            )
+        } else {
+            Icon(
+                if (osd.direction < 0) Icons.Filled.Replay10 else Icons.Filled.Forward10,
+                contentDescription = null,
+                tint = VegaPrimary,
+                modifier = Modifier.size(24.dp),
+            )
+            Spacer(Modifier.width(10.dp))
+            Text(
+                "${if (osd.direction < 0) "-" else "+"}${kotlin.math.abs(osd.stepMs) / 1000}s",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+                color = Color.White,
+            )
+            Spacer(Modifier.width(14.dp))
+            Text(
+                fmtMs(osd.targetMs),
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+                color = VegaPrimary,
+            )
+        }
     }
 }
 

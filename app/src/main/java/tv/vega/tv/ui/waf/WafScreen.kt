@@ -36,11 +36,11 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
-import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
@@ -103,9 +103,17 @@ private class PointerOverlay(c: Context) : View(c) {
 
     fun moveTo(x: Float, y: Float) {
         if (x == cx && y == cy) return
+        // Invalidate only the union of the old and new cursor, not the full
+        // screen: this view is composited over the WebView, and repainting the
+        // whole overlay on every remote press is visible jank on a TV SoC.
+        val r = radius + 3f * density
+        val left = (minOf(if (cx >= 0f) cx else x, x) - r).toInt()
+        val top = (minOf(if (cy >= 0f) cy else y, y) - r).toInt()
+        val right = (maxOf(if (cx >= 0f) cx else x, x) + r).toInt() + 1
+        val bottom = (maxOf(if (cy >= 0f) cy else y, y) + r).toInt() + 1
         cx = x
         cy = y
-        invalidate()
+        invalidate(left, top, right, bottom)
     }
 
     fun showAt(x: Float, y: Float) {
@@ -438,6 +446,9 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
     // until they find the toolbar toggle. Page mode is one press away for form
     // navigation and the keyboard hand-off.
     var mode by remember { mutableStateOf(NavMode.Pointer) }
+    // True while a toolbar button owns the D-pad. Pointer movement must yield
+    // to it, or the toolbar would be unreachable with the remote.
+    val toolbarFocused = remember { mutableStateOf(false) }
     val toolbarFocus = remember { FocusRequester() }
     val webViewFocus = remember { FocusRequester() }
     // Pointer keys arrive on the WebView's key listener (the page always keeps
@@ -451,7 +462,9 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
 
     val density = LocalDensity.current
     val pointerStep = with(density) { 18.dp.toPx() }
-    val pointerRepeatStep = with(density) { 9.dp.toPx() }
+    // Holding the direction accelerates; a repeat that moved *less* than the
+    // first press (the old 9dp) made crossing a 1080p page feel broken.
+    val pointerRepeatStep = with(density) { 30.dp.toPx() }
     val edgeScrollStep = with(density) { 28.dp.toPx() }
     var cursorX by remember { mutableFloatStateOf(-1f) }
     var cursorY by remember { mutableFloatStateOf(-1f) }
@@ -594,6 +607,54 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
         mode == NavMode.Pointer && handlePointerKeyCode(keyCode, repeatCount)
     }
 
+    /**
+     * One key path for both input models.
+     *
+     * Pointer mode moves the native cursor. Page mode hands the key straight
+     * to the WebView: the page may not hold Android focus (a toolbar button or
+     * the Compose host can own it), yet the page's injected spatial navigation
+     * is exactly what should handle the D-pad. Forwarding here works in every
+     * focus state and keeps Compose from moving focus behind the browser.
+     *
+     * The toolbar always yields: while one of its buttons is focused the
+     * remote must navigate those buttons, not the page underneath.
+     */
+    fun handleWafKey(event: AndroidKeyEvent): Boolean {
+        val down = event.action == AndroidKeyEvent.ACTION_DOWN
+        if (event.keyCode == AndroidKeyEvent.KEYCODE_MENU ||
+            event.keyCode == AndroidKeyEvent.KEYCODE_BUTTON_Y
+        ) {
+            if (down) focusToolbarAction.get().invoke()
+            return true
+        }
+        // While the keyboard is open the D-pad belongs to the IME.
+        if (webView?.imeVisible() == true) return false
+        if (toolbarFocused.value) return false
+        if (mode == NavMode.Pointer) {
+            return down && handlePointerKeyCode(event.keyCode, event.repeatCount)
+        }
+        val wv = webView ?: return false
+        return when (event.keyCode) {
+            AndroidKeyEvent.KEYCODE_DPAD_LEFT,
+            AndroidKeyEvent.KEYCODE_DPAD_RIGHT,
+            AndroidKeyEvent.KEYCODE_DPAD_UP,
+            AndroidKeyEvent.KEYCODE_DPAD_DOWN,
+            AndroidKeyEvent.KEYCODE_DPAD_CENTER,
+            AndroidKeyEvent.KEYCODE_ENTER,
+            AndroidKeyEvent.KEYCODE_NUMPAD_ENTER,
+            AndroidKeyEvent.KEYCODE_BUTTON_A,
+            -> wv.dispatchKeyEvent(event)
+            else -> false
+        }
+    }
+
+    val latestWafKey = rememberUpdatedState<(AndroidKeyEvent) -> Boolean>({ handleWafKey(it) })
+    DisposableEffect(Unit) {
+        val handler: (AndroidKeyEvent) -> Boolean = { latestWafKey.value(it) }
+        WafKeyBus.onKey = handler
+        onDispose { if (WafKeyBus.onKey === handler) WafKeyBus.onKey = null }
+    }
+
     /** Force the cursor to the centre after a toolbar round trip. */
     fun recenterPointer() {
         val wv = webView ?: return
@@ -702,16 +763,23 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
         } else {
             pointerOverlay?.visibility = View.GONE
         }
-        repeat(3) {
-            withFrameNanos { }
-            if (wv.requestFocus()) return@LaunchedEffect
+        repeat(30) {
+            // Focus fails for a frame or two while the overlay is first
+            // measured; the old three-frame attempt silently gave up and left
+            // page-mode keys owned by Compose. Keep asking for ~3s instead.
+            if (wv.hasFocus() || wv.requestFocus()) return@LaunchedEffect
+            delay(100)
         }
     }
 
     DisposableEffectBackHandler {
         when {
-            mode == NavMode.Pointer -> mode = NavMode.Page
+            // BACK from the toolbar returns to the page instead of turning
+            // pointer mode off or closing the browser.
+            toolbarFocused.value && webView != null -> webView?.requestFocus()
+            // The keyboard owns the first BACK.
             hideImeIfVisible() -> Unit
+            mode == NavMode.Pointer -> mode = NavMode.Page
             // A login flow is a browser: BACK follows its redirects first.
             webView?.canGoBack() == true -> webView?.goBack()
             else -> close()
@@ -751,7 +819,11 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
         },
     ) {
         Row(
-            Modifier.fillMaxWidth().height(56.dp).padding(horizontal = 12.dp),
+            Modifier
+                .fillMaxWidth()
+                .height(56.dp)
+                .padding(horizontal = 12.dp)
+                .onFocusChanged { toolbarFocused.value = it.hasFocus },
             horizontalArrangement = Arrangement.spacedBy(8.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {

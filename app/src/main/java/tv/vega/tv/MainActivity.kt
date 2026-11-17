@@ -11,14 +11,13 @@ import androidx.activity.compose.setContent
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.window.Dialog
-import androidx.compose.ui.window.DialogProperties
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
@@ -43,6 +42,7 @@ import tv.vega.tv.ui.settings.SettingsScreen
 import tv.vega.tv.ui.splash.SplashScreen
 import tv.vega.tv.ui.theme.VegaTVTheme
 import tv.vega.tv.ui.update.AutoUpdatePrompt
+import tv.vega.tv.ui.waf.WafKeyBus
 import tv.vega.tv.ui.waf.WafScreen
 import tv.vega.tv.ui.watchlist.WatchlistScreen
 
@@ -138,6 +138,12 @@ class MainActivity : ComponentActivity() {
             nav?.currentDestination?.route?.startsWith("waf") == true
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        // The challenge browser owns the remote while it is up, whichever view
+        // happens to hold focus. Offering the key here (before the focused
+        // WebView, Compose, or the player) is what makes its cursor move — a
+        // WebView key listener never runs when a Compose button or the Compose
+        // host holds focus instead.
+        if (wafOnScreen() && WafKeyBus.onKey?.invoke(event) == true) return true
         if (event.action == KeyEvent.ACTION_DOWN) {
             when (event.keyCode) {
                 KeyEvent.KEYCODE_BACK,
@@ -237,15 +243,152 @@ private fun AppNav() {
 
     // A provider's `openWebView` call suspends until a human clears the page.
     // It must surface wherever the call came from — catalog, detail, or the
-    // player — so the dialog lives above the NavHost instead of being a route:
-    // navigating away from the player would tear its ExoPlayer down.
+    // player — without navigating away from playback (that would tear its
+    // ExoPlayer down). The challenge is therefore an overlay in this window,
+    // not a Dialog: a second window has its own focus and key dispatch, which
+    // is exactly where the remote's D-pad got lost. In one window the activity
+    // sees every key (WafKeyBus), so the page, the toolbar and the pointer all
+    // share one input path.
     val pendingWaf by WafCoordinator.pending.collectAsStateWithLifecycle()
     val challenge = pendingWaf
-    if (challenge != null && nav.currentDestination?.route != Routes.WAF) {
-        Dialog(
-            onDismissRequest = { WafCoordinator.dismiss(challenge.id) },
-            properties = DialogProperties(usePlatformDefaultWidth = false),
+
+    Box(Modifier.fillMaxSize()) {
+        NavHost(
+            navController = nav,
+            startDestination = Routes.SPLASH,
+            // A full-screen alpha fade is the only transition that is essentially
+            // free on a TV GPU. It removes the hard cut between feed, detail and
+            // player without the layout cost of a slide (and without delaying the
+            // player: the incoming video starts under the fade).
+            enterTransition = { fadeIn(tween(140)) },
+            exitTransition = { fadeOut(tween(90)) },
+            popEnterTransition = { fadeIn(tween(140)) },
+            popExitTransition = { fadeOut(tween(90)) },
         ) {
+            composable(Routes.SPLASH) {
+                SplashScreen(onDone = {
+                    nav.navigate(Routes.HOME) { popUpTo(Routes.SPLASH) { inclusive = true } }
+                })
+            }
+            composable(Routes.HOME) {
+                HomeScreen(
+                    onOpenPost = { post ->
+                        PlaybackSession.playbackRequested = true
+                        PlaybackSession.pendingLink = post.link
+                        PlaybackSession.pendingTitle = post.title
+                        PlaybackSession.pendingPoster = post.image
+                        nav.navigate(Routes.DETAIL)
+                    },
+                    onOpenSearch = { nav.navigate(Routes.SEARCH) },
+                    onOpenWatchlist = { nav.navigate(Routes.WATCHLIST) },
+                    onOpenExtensions = { nav.navigate(Routes.EXTENSIONS) },
+                    onOpenSettings = { nav.navigate(Routes.SETTINGS) },
+                    onPlayEntry = {
+                        PlaybackSession.playbackRequested = true
+                        nav.navigate(Routes.PLAYER)
+                    },
+                    onOpenCategory = { title, filter ->
+                        nav.navigate(Routes.catalog(title, filter))
+                    },
+                )
+            }
+            composable(Routes.CATALOG,
+                arguments = listOf(
+                    navArgument("title") { type = NavType.StringType; defaultValue = "" },
+                    navArgument("filter") { type = NavType.StringType; defaultValue = "" },
+                ),
+            ) { entry ->
+                CatalogScreen(
+                    title = entry.arguments?.getString("title").orEmpty(),
+                    filter = entry.arguments?.getString("filter").orEmpty(),
+                    onOpenPost = { post ->
+                        PlaybackSession.playbackRequested = true
+                        PlaybackSession.pendingLink = post.link
+                        PlaybackSession.pendingTitle = post.title
+                        PlaybackSession.pendingPoster = post.image
+                        // A catalog page is bound to the provider scope it was
+                        // opened in, which is active; no per-card handoff.
+                        PlaybackSession.pendingProvider = ""
+                        nav.navigate(Routes.DETAIL)
+                    },
+                    onBack = { nav.popBackStack() },
+                )
+            }
+            composable(Routes.SEARCH) {
+                SearchScreen(
+                    onOpenPost = { post ->
+                        PlaybackSession.playbackRequested = true
+                        PlaybackSession.pendingLink = post.link
+                        PlaybackSession.pendingTitle = post.title
+                        PlaybackSession.pendingPoster = post.image
+                        // Results are fanned out across providers, so a row may
+                        // belong to a provider that is not the active one. Open
+                        // it on the provider that actually listed it.
+                        PlaybackSession.pendingProvider = post.origin
+                        nav.navigate(Routes.DETAIL)
+                    },
+                    onSolveWaf = { url -> nav.navigate(Routes.waf(url)) },
+                )
+            }
+            composable(Routes.WATCHLIST) {
+                WatchlistScreen(
+                    onOpenItem = {
+                        PlaybackSession.playbackRequested = true
+                        nav.navigate(Routes.DETAIL)
+                    },
+                    onBrowse = {
+                        nav.navigate(Routes.HOME) { popUpTo(Routes.HOME) { inclusive = true } }
+                    },
+                )
+            }
+            composable(Routes.EXTENSIONS) {
+                ExtensionsScreen(
+                    onOpenSettings = { nav.navigate(Routes.PROVIDER_SETTINGS) },
+                )
+            }
+            composable(Routes.PROVIDER_SETTINGS) {
+                ProviderSettingsScreen(onBack = { nav.popBackStack() })
+            }
+            composable(Routes.SETTINGS) {
+                SettingsScreen(onBack = { nav.popBackStack() })
+            }
+            composable(Routes.DETAIL) {
+                DetailScreen(
+                    onPlay = {
+                        PlaybackSession.playbackRequested = true
+                        nav.navigate(Routes.PLAYER)
+                    },
+                    onBack = { nav.popBackStack() },
+                    onSolveWaf = { url -> nav.navigate(Routes.waf(url)) },
+                )
+            }
+            composable(Routes.PLAYER) {
+                PlayerScreen(
+                    onBack = { nav.popBackStack() },
+                    onSolveWaf = { url -> nav.navigate(Routes.waf(url)) },
+                )
+            }
+            composable(
+                Routes.WAF,
+                arguments = listOf(navArgument("url") { type = NavType.StringType; defaultValue = "" }),
+            ) { entry ->
+                val url = entry.arguments?.getString("url").orEmpty()
+                WafScreen(
+                    url = url,
+                    onSolved = { nav.popBackStack() },
+                    onClose = { nav.popBackStack() },
+                )
+            }
+        }
+
+        // Sits above the NavHost but only ever shows on a browse screen; see
+        // the composable for why it refuses to cover playback.
+        AutoUpdatePrompt()
+
+        // The challenge covers everything, including the update notice. It
+        // lives in this window so WafKeyBus can route the remote; a Dialog
+        // would get its own key dispatch and lose the D-pad.
+        if (challenge != null && nav.currentDestination?.route != Routes.WAF) {
             Surface(Modifier.fillMaxSize(), color = Color.Black) {
                 WafScreen(
                     url = challenge.url,
@@ -255,134 +398,4 @@ private fun AppNav() {
             }
         }
     }
-
-    NavHost(
-        navController = nav,
-        startDestination = Routes.SPLASH,
-        // A full-screen alpha fade is the only transition that is essentially
-        // free on a TV GPU. It removes the hard cut between feed, detail and
-        // player without the layout cost of a slide (and without delaying the
-        // player: the incoming video starts under the fade).
-        enterTransition = { fadeIn(tween(140)) },
-        exitTransition = { fadeOut(tween(90)) },
-        popEnterTransition = { fadeIn(tween(140)) },
-        popExitTransition = { fadeOut(tween(90)) },
-    ) {
-        composable(Routes.SPLASH) {
-            SplashScreen(onDone = {
-                nav.navigate(Routes.HOME) { popUpTo(Routes.SPLASH) { inclusive = true } }
-            })
-        }
-        composable(Routes.HOME) {
-            HomeScreen(
-                onOpenPost = { post ->
-                    PlaybackSession.playbackRequested = true
-                    PlaybackSession.pendingLink = post.link
-                    PlaybackSession.pendingTitle = post.title
-                    PlaybackSession.pendingPoster = post.image
-                    nav.navigate(Routes.DETAIL)
-                },
-                onOpenSearch = { nav.navigate(Routes.SEARCH) },
-                onOpenWatchlist = { nav.navigate(Routes.WATCHLIST) },
-                onOpenExtensions = { nav.navigate(Routes.EXTENSIONS) },
-                onOpenSettings = { nav.navigate(Routes.SETTINGS) },
-                onPlayEntry = {
-                    PlaybackSession.playbackRequested = true
-                    nav.navigate(Routes.PLAYER)
-                },
-                onOpenCategory = { title, filter ->
-                    nav.navigate(Routes.catalog(title, filter))
-                },
-            )
-        }
-        composable(Routes.CATALOG,
-            arguments = listOf(
-                navArgument("title") { type = NavType.StringType; defaultValue = "" },
-                navArgument("filter") { type = NavType.StringType; defaultValue = "" },
-            ),
-        ) { entry ->
-            CatalogScreen(
-                title = entry.arguments?.getString("title").orEmpty(),
-                filter = entry.arguments?.getString("filter").orEmpty(),
-                onOpenPost = { post ->
-                    PlaybackSession.playbackRequested = true
-                    PlaybackSession.pendingLink = post.link
-                    PlaybackSession.pendingTitle = post.title
-                    PlaybackSession.pendingPoster = post.image
-                    // A catalog page is bound to the provider scope it was
-                    // opened in, which is active; no per-card handoff.
-                    PlaybackSession.pendingProvider = ""
-                    nav.navigate(Routes.DETAIL)
-                },
-                onBack = { nav.popBackStack() },
-            )
-        }
-        composable(Routes.SEARCH) {
-            SearchScreen(
-                onOpenPost = { post ->
-                    PlaybackSession.playbackRequested = true
-                    PlaybackSession.pendingLink = post.link
-                    PlaybackSession.pendingTitle = post.title
-                    PlaybackSession.pendingPoster = post.image
-                    // Search results follow the active provider scope.
-                    PlaybackSession.pendingProvider = ""
-                    nav.navigate(Routes.DETAIL)
-                },
-                onSolveWaf = { url -> nav.navigate(Routes.waf(url)) },
-            )
-        }
-        composable(Routes.WATCHLIST) {
-            WatchlistScreen(
-                onOpenItem = {
-                    PlaybackSession.playbackRequested = true
-                    nav.navigate(Routes.DETAIL)
-                },
-                onBrowse = {
-                    nav.navigate(Routes.HOME) { popUpTo(Routes.HOME) { inclusive = true } }
-                },
-            )
-        }
-        composable(Routes.EXTENSIONS) {
-            ExtensionsScreen(
-                onOpenSettings = { nav.navigate(Routes.PROVIDER_SETTINGS) },
-            )
-        }
-        composable(Routes.PROVIDER_SETTINGS) {
-            ProviderSettingsScreen(onBack = { nav.popBackStack() })
-        }
-        composable(Routes.SETTINGS) {
-            SettingsScreen(onBack = { nav.popBackStack() })
-        }
-        composable(Routes.DETAIL) {
-            DetailScreen(
-                onPlay = {
-                    PlaybackSession.playbackRequested = true
-                    nav.navigate(Routes.PLAYER)
-                },
-                onBack = { nav.popBackStack() },
-                onSolveWaf = { url -> nav.navigate(Routes.waf(url)) },
-            )
-        }
-        composable(Routes.PLAYER) {
-            PlayerScreen(
-                onBack = { nav.popBackStack() },
-                onSolveWaf = { url -> nav.navigate(Routes.waf(url)) },
-            )
-        }
-        composable(
-            Routes.WAF,
-            arguments = listOf(navArgument("url") { type = NavType.StringType; defaultValue = "" }),
-        ) { entry ->
-            val url = entry.arguments?.getString("url").orEmpty()
-            WafScreen(
-                url = url,
-                onSolved = { nav.popBackStack() },
-                onClose = { nav.popBackStack() },
-            )
-        }
-    }
-
-    // Sits above the NavHost but only ever shows on a browse screen; see the
-    // composable for why it refuses to cover playback.
-    AutoUpdatePrompt()
 }

@@ -18,6 +18,18 @@ data class ProviderExtension(
     val display_name: String = "",
     val source: ProviderSourceRef = ProviderSourceRef(),
     val version: String = "",
+    /**
+     * Manifest opt-in: every module starts with
+     * `// @vega-provider <value>` and `// @vega-version <version>`.
+     *
+     * A version number alone cannot tell a TV app whether the files on disk
+     * match the files upstream: the manifest version is bumped by hand, and a
+     * provider that fixes its parser without bumping it leaves every installed
+     * copy stale forever. When the source opts in, the stamp is checked
+     * directly, so a file downloaded before stamping existed is recognised as
+     * stale and refreshed once.
+     */
+    val moduleVersionHeader: Boolean = false,
     val icon: String = "",
     val disabled: Boolean = false,
     val type: String = "global",
@@ -48,6 +60,12 @@ data class ProviderModules(
     val cachedAt: Long = 0L,
 )
 
+/** Modules a provider cannot run without. */
+internal val REQUIRED_MODULES = listOf("posts", "meta", "stream", "catalog")
+
+/** Modules a provider may omit; a 404 also deletes any stale local copy. */
+internal val OPTIONAL_MODULES = listOf("episodes", "settings")
+
 internal fun isNewerProviderVersion(candidate: String, current: String): Boolean {
     fun parts(version: String): List<Int> = version.split('.').map { raw ->
         raw.trim().takeWhile { it.isDigit() }.toIntOrNull() ?: 0
@@ -62,6 +80,113 @@ internal fun isNewerProviderVersion(candidate: String, current: String): Boolean
     }
     return false
 }
+
+/*
+ * Provider module version stamps.
+ *
+ * Port of the mobile app's `providerVersion.ts`. The first two lines of a
+ * module are `// @vega-provider <value>` / `// @vega-version <version>`. They
+ * exist to spot a stale CDN body during install, and — on a client that has
+ * been running for months — to spot files downloaded before the source
+ * stamped them.
+ *
+ * Semantics are kept identical to the mobile app:
+ *  - a module with no header and no stray `@vega-` token is an older
+ *    unversioned bundle and is accepted;
+ *  - a malformed header is an error, never silently accepted;
+ *  - a complete module set may not mix stamped and unstamped files.
+ */
+
+internal sealed interface ModuleStamp {
+    data class Stamped(val provider: String, val version: String) : ModuleStamp
+    data object Unstamped : ModuleStamp
+    data object Invalid : ModuleStamp
+}
+
+private val MODULE_HEADER = Regex(
+    "^\uFEFF?// @vega-provider ([A-Za-z0-9_.-]+)\r?\n" +
+        "// @vega-version ([A-Za-z0-9_.+-]+)(?:\r?\n|$)",
+)
+private val MODULE_HEADER_TOKEN = Regex("@vega-(?:provider|version)\\b")
+
+/** Read the banner without scanning a 2MB bundle. */
+internal fun moduleStamp(code: String): ModuleStamp {
+    val prefix = code.take(512)
+    val header = MODULE_HEADER.find(prefix)
+        ?: return if (MODULE_HEADER_TOKEN.containsMatchIn(prefix)) {
+            ModuleStamp.Invalid
+        } else {
+            ModuleStamp.Unstamped
+        }
+    return ModuleStamp.Stamped(header.groupValues[1], header.groupValues[2])
+}
+
+/**
+ * True when a module already on disk carries a matching stamp.
+ *
+ * Missing, unversioned and malformed modules are all "not current" here: a
+ * source that opted into [ProviderExtension.moduleVersionHeader] expects the
+ * stamp, so an unstamped file predates the opt-in and may be arbitrarily old.
+ */
+internal fun installedModuleIsCurrent(code: String?, value: String, version: String): Boolean {
+    if (code.isNullOrBlank()) return false
+    val stamp = moduleStamp(code)
+    return stamp is ModuleStamp.Stamped &&
+        stamp.provider == value &&
+        stamp.version == version
+}
+
+/**
+ * Validate one freshly downloaded module.
+ *
+ * Returns true when the file is stamped. Throws [ProviderModuleOutOfSync] for
+ * a malformed stamp or one that names another provider/version, which the
+ * caller turns into one retry and then an aborted install.
+ */
+internal fun validateDownloadedModule(
+    code: String,
+    value: String,
+    version: String,
+    kind: String,
+): Boolean = when (val stamp = moduleStamp(code)) {
+    is ModuleStamp.Stamped -> {
+        if (stamp.provider != value || stamp.version != version) {
+            throw ProviderModuleOutOfSync(
+                "$kind.js belongs to ${stamp.provider} v${stamp.version}, " +
+                    "expected $value v$version. Retry shortly.",
+            )
+        }
+        true
+    }
+    ModuleStamp.Invalid -> throw ProviderModuleOutOfSync(
+        "$kind.js has a missing or invalid version header. Retry shortly.",
+    )
+    ModuleStamp.Unstamped -> false
+}
+
+/**
+ * A partially propagated deployment must not mix stamped and unstamped files:
+ * the mix means some files are new and some are from an older publish.
+ */
+internal fun validateDownloadedModuleSet(
+    codes: Map<String, String>,
+    value: String,
+    version: String,
+) {
+    if (codes.isEmpty()) return
+    val stamped = codes.map { (kind, code) ->
+        validateDownloadedModule(code, value, version, kind)
+    }
+    if (stamped.any { it } && stamped.any { !it }) {
+        throw ProviderModuleOutOfSync(
+            "Provider files are not synchronized (mixed versioned and unversioned " +
+                "files). Retry shortly.",
+        )
+    }
+}
+
+/** A source is mid-publish; retry later rather than installing a mixed set. */
+class ProviderModuleOutOfSync(message: String) : Exception(message)
 
 /**
  * Port of web `createProviderSource` / `getProviderFilesUrl` /

@@ -2,6 +2,7 @@ package tv.vega.tv.data.model
 
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.Transient
 import kotlinx.serialization.descriptors.PrimitiveKind
 import kotlinx.serialization.descriptors.PrimitiveSerialDescriptor
 import kotlinx.serialization.descriptors.SerialDescriptor
@@ -50,6 +51,16 @@ data class VegaPost(
     val tag: String? = null,
     val cornerTag: String? = null,
     val badge: String? = null,
+    /**
+     * "author:value" of the provider this row was listed by, set by the
+     * repository when results from several providers are mixed. Display code
+     * must use [provider] instead; this is the handoff that points the app's
+     * active provider at the origin before opening the post.
+     *
+     * Transient: it is app state, not part of the provider JSON contract.
+     */
+    @Transient
+    val origin: String = "",
 )
 
 @Serializable
@@ -67,6 +78,31 @@ data class SubtitleTrack(
     val uri: String = "",
 )
 
+/**
+ * Upstream providers/types.ts `StreamDrm`.
+ *
+ * New provider releases attach this to a `getStream` result (inline ClearKey
+ * for live DASH, or a Widevine/PlayReady license endpoint). Without the field
+ * the keys were silently dropped and Media3 reported
+ * `ERROR_CODE_DRM_SCHEME_UNSUPPORTED` on a stream that was perfectly playable.
+ * Nullable collections: the JSON is provider-authored, and a `null` where an
+ * object is expected must not fail the whole stream list.
+ */
+@Serializable
+data class StreamDrm(
+    /** `clearkey`, `widevine`, `playready` or `fairplay`. */
+    val type: String = "",
+    val licenseServer: String? = null,
+    /** License-request headers, separate from the stream/manifest headers. */
+    val headers: Map<String, String>? = null,
+    /** 32-char hex key ID -> 32-char hex key. */
+    val clearKeys: Map<String, String>? = null,
+    val multiDrm: Boolean? = null,
+    val contentId: String? = null,
+    val certificateUrl: String? = null,
+    val base64Certificate: Boolean? = null,
+)
+
 @Serializable
 data class VegaStream(
     val server: String = "",
@@ -77,6 +113,7 @@ data class VegaStream(
     val tags: List<String> = emptyList(),
     val subtitles: List<SubtitleTrack> = emptyList(),
     val headers: Map<String, String> = emptyMap(),
+    val drm: StreamDrm? = null,
     val skip: List<SkipInterval> = emptyList(),
 )
 

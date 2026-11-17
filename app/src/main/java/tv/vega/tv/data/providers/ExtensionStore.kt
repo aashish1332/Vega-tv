@@ -173,4 +173,12 @@ class ExtensionStore(private val context: Context) {
         f.parentFile?.mkdirs()
         f.writeText(code)
     }
+
+    /**
+     * Remove one module file. Used when the source answers 404/410 for an
+     * optional module: leaving the old file behind made the app keep running
+     * an episodes parser the upstream had deliberately deleted.
+     */
+    fun deleteModuleCode(value: String, author: String, kind: String): Boolean =
+        moduleFile(value, author, kind).delete()
 }

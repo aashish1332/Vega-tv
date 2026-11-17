@@ -6,15 +6,17 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import tv.vega.tv.data.ServiceLocator
-import tv.vega.tv.data.model.VegaPost
+import tv.vega.tv.data.providers.readableProviderError
+import tv.vega.tv.data.repo.SearchOutcome
 import tv.vega.tv.ui.common.UiState
 
 class SearchViewModel : ViewModel() {
     private val _state =
-        MutableStateFlow<UiState<List<VegaPost>>>(UiState.Success(emptyList()))
-    val state: StateFlow<UiState<List<VegaPost>>> = _state
+        MutableStateFlow<UiState<SearchOutcome>>(UiState.Success(SearchOutcome()))
+    val state: StateFlow<UiState<SearchOutcome>> = _state
     private val _wafUrl = MutableStateFlow<String?>(null)
     val wafUrl: StateFlow<String?> = _wafUrl
 
@@ -34,8 +36,24 @@ class SearchViewModel : ViewModel() {
         job = viewModelScope.launch {
             _state.value = UiState.Loading
             _wafUrl.value = null
-            runCatching { ServiceLocator.repository.search(q, 1) }
-                .onSuccess { _state.value = UiState.Success(it) }
+            runCatching {
+                ServiceLocator.repository.search(q, 1) { partial ->
+                    // Progressive fill: only while this is still the search the
+                    // viewer is waiting for. A superseded search has its scope
+                    // cancelled, so its late provider result is dropped here.
+                    if (isActive) {
+                        _wafUrl.value = partial.wafUrl
+                        _state.value = UiState.Success(partial)
+                    }
+                }
+            }
+                .onSuccess { outcome ->
+                    // A challenge on one provider is actionable, but it must not
+                    // hide the rows other providers returned. Keep the URL so the
+                    // results screen can offer "Solve challenge".
+                    _wafUrl.value = outcome.wafUrl
+                    _state.value = UiState.Success(outcome)
+                }
                 .onFailure { e ->
                     // Cancellation is not a search failure. Reporting it as one
                     // means a superseded search replaces the results the user is
@@ -46,7 +64,9 @@ class SearchViewModel : ViewModel() {
                         _wafUrl.value = e.url.ifBlank { null }
                         _state.value = UiState.Error("Challenge required at ${e.host.ifBlank { "provider" }}")
                     } else {
-                        _state.value = UiState.Error(e.message ?: "Search failed")
+                        _state.value = UiState.Error(
+                            readableProviderError(e, fallback = "Search failed. Try again."),
+                        )
                     }
                 }
         }

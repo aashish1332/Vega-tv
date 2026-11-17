@@ -9,6 +9,7 @@ import tv.vega.tv.data.model.VegaInfo
 import tv.vega.tv.data.model.VegaPost
 import tv.vega.tv.data.model.VegaStream
 import tv.vega.tv.data.providers.ProviderManager
+import tv.vega.tv.data.providers.readableProviderError
 import tv.vega.tv.data.settings.AppSettings
 
 private const val TAG = "VegaRepo"
@@ -31,6 +32,23 @@ data class CatalogResult(
 data class PostPage(
     val posts: List<VegaPost>,
     val rawCount: Int,
+)
+
+/**
+ * A search across the installed providers.
+ *
+ * [providerCount] is how many were asked, [failedCount] how many did not answer.
+ * [firstError] is one readable sentence for the first failure; it is only worth
+ * showing when it explains a missing result (some or all providers failed).
+ * [wafUrl] carries the first challenge so the screen can offer to solve it
+ * without hiding the results the other providers did return.
+ */
+data class SearchOutcome(
+    val posts: List<VegaPost> = emptyList(),
+    val providerCount: Int = 0,
+    val failedCount: Int = 0,
+    val firstError: String? = null,
+    val wafUrl: String? = null,
 )
 
 /**
@@ -210,12 +228,77 @@ class VegaRepository(
         return PostPage(unique(raw, familyOn), raw.size)
     }
 
-    suspend fun search(query: String, page: Int): List<VegaPost> {
-        val a = active() ?: return emptyList()
-        // Fan-out across installed providers comes later; active first (web
-        // SearchResults fans out, but single-provider keeps weak boxes fast).
+    /**
+     * Search every installed provider, active first.
+     *
+     * The mobile app's SearchResults fans out for the same reason: a title one
+     * provider lost (or never indexed) is routinely carried by another, and a
+     * TV viewer has no way to guess which one. Failures are per provider — one
+     * blocked or broken module must not hide the others' rows. Results are
+     * deduped by title across the whole fan-out, so the active provider's copy
+     * wins when two sites carry the same release.
+     */
+    suspend fun search(
+        query: String,
+        page: Int,
+        onPartial: ((SearchOutcome) -> Unit)? = null,
+    ): SearchOutcome {
+        val targets = pm.searchTargets()
+        if (targets.isEmpty()) {
+            return SearchOutcome(
+                providerCount = 0,
+                firstError = "No provider is installed. Add one on the Providers screen, then search.",
+            )
+        }
         val familyOn = runCatching { settings.familyFilter.first() }.getOrDefault(true)
-        return unique(pm.getSearchPosts(a, query, page), familyOn)
+        val seenTitles = HashSet<String>()
+        val posts = ArrayList<VegaPost>()
+        var failed = 0
+        var firstError: String? = null
+        var wafUrl: String? = null
+        fun snapshot() = SearchOutcome(
+            posts = posts.toList(),
+            providerCount = targets.size,
+            failedCount = failed,
+            firstError = firstError,
+            wafUrl = wafUrl,
+        )
+        for (a in targets) {
+            val ref = "${a.ext.source.author}:${a.ext.value}"
+            val raw = try {
+                pm.getSearchPosts(a, query, page)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: ProviderManager.WafRequired) {
+                failed++
+                if (wafUrl == null) wafUrl = e.url.ifBlank { null }
+                if (firstError == null) firstError = readableProviderError(e)
+                continue
+            } catch (e: Throwable) {
+                // readableProviderError writes the raw exception to logcat; the
+                // returned sentence is what the TV screen may show.
+                failed++
+                if (firstError == null) {
+                    firstError = readableProviderError(
+                        e,
+                        "The provider could not search right now.",
+                    )
+                }
+                continue
+            }
+            for (post in raw) {
+                if (familyOn && !FamilyFilter.isAllowed(post)) continue
+                if (!seenTitles.add(FamilyFilter.dedupeKey(post.title))) continue
+                posts += if (post.origin.isBlank()) post.copy(origin = ref) else post
+            }
+            // Publish each provider's rows as they land: the sandbox serializes
+            // invokes, so waiting for the slowest provider would leave the
+            // viewer staring at a spinner after the active provider had already
+            // answered. An empty partial is not published — it would flash
+            // "no results" before the remaining providers ran.
+            if (posts.isNotEmpty()) onPartial?.invoke(snapshot())
+        }
+        return snapshot()
     }
 
     private fun unique(posts: List<VegaPost>, familyOn: Boolean): List<VegaPost> {

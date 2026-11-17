@@ -27,6 +27,14 @@ private const val TAG = "VegaProviderManager"
  */
 private const val GET_STREAM_TIMEOUT_MS = 45_000L
 
+/**
+ * Upstream `SearchResults` gives each provider 25 s. Search is interactive —
+ * a provider that has not answered in that budget is not going to make the
+ * screen better, and the fan-out is serialized by the provider sandbox, so a
+ * longer budget multiplies across installed providers.
+ */
+private const val SEARCH_TIMEOUT_MS = 25_000L
+
 /** Upstream `updateCheckIntervalMs`: providers are refreshed at most 4x/day. */
 private const val UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1000L
 
@@ -124,14 +132,26 @@ class ProviderManager(appContext: Context) {
                     }
                     val latest = latestByValue[ext.value] ?: continue
                     if (latest.disabled) continue
-                    if (!isNewerProviderVersion(latest.version, ext.version)) continue
+                    val newerVersion = isNewerProviderVersion(latest.version, ext.version)
+                    // The manifest version is bumped by hand. A provider that
+                    // fixes its parser without bumping it used to keep every
+                    // installed copy on the old code for ever; the module
+                    // stamp tells the truth even then.
+                    val staleModules = !newerVersion &&
+                        latest.moduleVersionHeader &&
+                        installedModulesStale(ext, latest)
+                    if (!newerVersion && !staleModules) continue
                     runCatching {
                         // downloadModules also writes the installed provider
                         // metadata (including a renamed icon/path).
                         api.downloadModules(source, latest)
                     }.onSuccess {
                         updated++
-                        Log.i(TAG, "Updated ${ext.value} ${ext.version} -> ${latest.version}")
+                        if (newerVersion) {
+                            Log.i(TAG, "Updated ${ext.value} ${ext.version} -> ${latest.version}")
+                        } else {
+                            Log.i(TAG, "Refreshed stale modules for ${ext.value} ${ext.version}")
+                        }
                     }.onFailure {
                         failed++
                         Log.w(TAG, "Update failed for ${ext.value}: ${it.message}")
@@ -152,6 +172,30 @@ class ProviderManager(appContext: Context) {
             }
             UpdateReport(checkedSources = checked, updated = updated, failed = failed)
         }
+    }
+
+    /**
+     * True when at least one installed module is missing its version stamp or
+     * carries a different one than the manifest.
+     *
+     * Only called for sources that set `moduleVersionHeader`. The four
+     * required modules are checked unconditionally; optional modules are only
+     * checked when a file exists, because a provider is allowed not to ship
+     * them at all.
+     */
+    private suspend fun installedModulesStale(
+        ext: ProviderExtension,
+        latest: ProviderExtension,
+    ): Boolean {
+        for (kind in REQUIRED_MODULES) {
+            val code = store.readModuleCode(ext.value, ext.source.author, kind)
+            if (!installedModuleIsCurrent(code, ext.value, latest.version)) return true
+        }
+        for (kind in OPTIONAL_MODULES) {
+            val code = store.readModuleCode(ext.value, ext.source.author, kind) ?: continue
+            if (!installedModuleIsCurrent(code, ext.value, latest.version)) return true
+        }
+        return false
     }
 
     suspend fun active(): Active? = withContext(Dispatchers.IO) {
@@ -188,6 +232,28 @@ class ProviderManager(appContext: Context) {
 
     /** Every installed provider (the sidebar lists them for switching). */
     suspend fun installed(): List<ProviderExtension> = withContext(Dispatchers.IO) { store.installed() }
+
+    /**
+     * Installed providers paired with their source, ordered for a multi-provider
+     * search: the active provider first, then the rest in install order.
+     *
+     * The sandbox serializes invokes, so this order is also the execution order.
+     * Putting the active provider first means the rows the viewer is most likely
+     * to want appear first even when a later provider is slow or blocked.
+     */
+    suspend fun searchTargets(): List<Active> = withContext(Dispatchers.IO) {
+        ensureSeeded()
+        val sources = store.sources().associateBy { it.author }
+        val targets = store.installed().mapNotNull { ext ->
+            sources[ext.source.author]?.let { Active(ext, it) }
+        }
+        val activeRef = store.activeRef()
+        if (activeRef.isNullOrBlank()) {
+            targets
+        } else {
+            targets.sortedByDescending { "${it.ext.source.author}:${it.ext.value}" == activeRef }
+        }
+    }
 
     /**
      * Mobile (ExtensionManager.initialize) seeds the official `Zenda-Cross`
@@ -335,12 +401,26 @@ class ProviderManager(appContext: Context) {
         return requirePosts(raw, a.ext.value, "getPosts")
     }
 
-    suspend fun getSearchPosts(a: Active, query: String, page: Int): List<VegaPost> {
+    suspend fun getSearchPosts(
+        a: Active,
+        query: String,
+        page: Int,
+        timeoutMs: Long = SEARCH_TIMEOUT_MS,
+    ): List<VegaPost> {
         val code = moduleCode(a, "posts")
         val params = JSONObject().put("searchQuery", query).put("page", page).put("providerValue", a.ext.value).toString()
         // Some providers omit search; fall back to empty (mirrors web optional).
         val raw = try {
-            guarded { js.invoke(a.ext.value, code, "getSearchPosts", params, commonHeaders()) }
+            guarded {
+                js.invoke(
+                    a.ext.value,
+                    code,
+                    "getSearchPosts",
+                    params,
+                    commonHeaders(),
+                    timeoutMs = timeoutMs,
+                )
+            }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {

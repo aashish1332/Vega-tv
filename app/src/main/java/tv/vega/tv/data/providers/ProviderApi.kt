@@ -65,38 +65,42 @@ class ProviderApi(
             list
         }
 
+    /**
+     * Fetch every module, validate the set, and only then write it.
+     *
+     * The old implementation wrote each file as it arrived. A timeout on
+     * `stream.js` after `meta.js` had been replaced left a provider running
+     * new metadata against old stream code — and a provider whose manifest
+     * version had *not* changed (so the next pass never retried) could stay in
+     * that state indefinitely. Now a failed or half-propagated fetch leaves the
+     * previous working install untouched.
+     */
     suspend fun downloadModules(source: ProviderSource, ext: ProviderExtension) =
         withContext(Dispatchers.IO) {
-            val kinds = listOf("posts" to true, "meta" to true, "stream" to true, "catalog" to true, "episodes" to false, "settings" to false)
-            val got = mutableMapOf<String, String?>()
+            val required = REQUIRED_MODULES
+            val optional = OPTIONAL_MODULES
             val base = ProviderUrls.filesUrl(source.url, ext.value, ext.path)
-            for ((kind, required) in kinds) {
-                // Player start cancels this coroutine. A blocking execute cannot
-                // be interrupted, so re-check immediately after it returns and
-                // before any module is written: a partially updated provider is
-                // worse than an old one.
+            val got = LinkedHashMap<String, String>()
+            for (kind in required) {
                 currentCoroutineContext().ensureActive()
-                val url = "$base/$kind.js?t=${System.currentTimeMillis()}"
-                try {
-                    val req = Request.Builder().url(url).header("Cache-Control", "no-cache").build()
-                    val call = client(15).newCall(req)
-                    call.execute().use { resp ->
-                        currentCoroutineContext().ensureActive()
-                        if (!resp.isSuccessful) {
-                            if (required) throw ProviderModuleMissing("$kind: HTTP ${resp.code}")
-                            got[kind] = null
-                        } else {
-                            val code = resp.body?.string().orEmpty()
-                            require(code.length < 2 * 1024 * 1024) { "$kind module exceeds 2MB" }
-                            got[kind] = code
-                            store.writeModuleCode(ext.value, source.author, kind, code)
-                        }
-                    }
-                } catch (e: ProviderModuleMissing) { throw e }
-                catch (e: Exception) {
-                    if (required) throw e
-                    got[kind] = null
-                }
+                got[kind] = downloadModule(base, kind, ext, required = true)!!
+            }
+            val absent = ArrayList<String>(2)
+            for (kind in optional) {
+                currentCoroutineContext().ensureActive()
+                val code = downloadModule(base, kind, ext, required = false)
+                if (code == null) absent += kind else got[kind] = code
+            }
+            // A source that is mid-publish can answer with one module from the
+            // new version and the rest from the old one. Reject the set instead
+            // of committing a provider that cannot work.
+            validateDownloadedModuleSet(got, ext.value, ext.version)
+            currentCoroutineContext().ensureActive()
+            for ((kind, code) in got) {
+                store.writeModuleCode(ext.value, source.author, kind, code)
+            }
+            for (kind in absent) {
+                store.deleteModuleCode(ext.value, source.author, kind)
             }
             currentCoroutineContext().ensureActive()
             store.putModule(
@@ -109,6 +113,53 @@ class ProviderApi(
             )
             store.install(ext)
         }
+
+    /**
+     * One module with the mobile app's retry rule: a version-stamp mismatch is
+     * usually a CDN still serving the previous publish, so fetch it once more
+     * with a different cache key. A required file that is still missing or
+     * unsynchronised aborts the whole install.
+     */
+    private suspend fun downloadModule(
+        base: String,
+        kind: String,
+        ext: ProviderExtension,
+        required: Boolean,
+    ): String? {
+        var mismatch: ProviderModuleOutOfSync? = null
+        repeat(2) { attempt ->
+            currentCoroutineContext().ensureActive()
+            val version = java.net.URLEncoder.encode(ext.version, "UTF-8")
+            val url = "$base/$kind.js?v=$version&t=${System.currentTimeMillis()}-$attempt"
+            val req = Request.Builder()
+                .url(url)
+                .header("Cache-Control", "no-cache, no-store, must-revalidate")
+                .header("Pragma", "no-cache")
+                .header("Expires", "0")
+                .build()
+            val call = client(15).newCall(req)
+            call.execute().use { resp ->
+                currentCoroutineContext().ensureActive()
+                if (!resp.isSuccessful) {
+                    // Optional files are allowed to be gone: upstream deleted
+                    // the parser, and the stale local copy must go with it.
+                    if (!required && (resp.code == 404 || resp.code == 410)) return null
+                    throw ProviderModuleMissing("$kind: HTTP ${resp.code}")
+                }
+                val code = resp.body?.string().orEmpty()
+                require(code.isNotBlank()) { "$kind module is empty" }
+                require(code.length < 2 * 1024 * 1024) { "$kind module exceeds 2MB" }
+                try {
+                    validateDownloadedModule(code, ext.value, ext.version, kind)
+                    return code
+                } catch (e: ProviderModuleOutOfSync) {
+                    // Retry once; the second failure is reported to the caller.
+                    mismatch = e
+                }
+            }
+        }
+        throw mismatch ?: ProviderModuleMissing("$kind: empty response")
+    }
 
     class ProviderRateLimited : Exception("GitHub rate limit exceeded. Wait a few minutes and retry.")
     class ProviderModuleMissing(msg: String) : Exception(msg)
