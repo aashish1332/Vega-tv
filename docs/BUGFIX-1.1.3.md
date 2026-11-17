@@ -78,4 +78,13 @@ Status: [ ] pending · [~] in progress · [x] fixed & compile-verified · [B] ve
      opening a result sets `PlaybackSession.pendingProvider` so the detail page resolves the
      link on the provider that actually listed it, not whichever was active.
 
-6. [ ] Build 1.1.3 APK, verify, commit, push, release.
+6. [x] Build 1.1.3 APK, verify, commit, push, release.
+   - `:app:assembleDebug` BUILD SUCCESSFUL; APK `app/build/outputs/apk/debug/app-debug.apk`,
+     23,635,198 bytes, SHA-256 `7C5DF026FB60370871EE56A14AC56AD6AE5DA6DFBE28E310A57529ECC5D0C37D`,
+     `versionCode 5` / `versionName 1.1.3`, minSdk 21, targetSdk 34, certificate
+     `5595d8d0…b22252` (same key as 1.1.2).
+   - Committed `8427f40`, pushed `main`, tagged `v1.1.3`, released:
+     https://github.com/aashish1332/Vega-tv/releases/tag/v1.1.3 (asset `app-debug.apk`,
+     23,635,198 bytes, uploaded).
+   - Runtime feel checks (browser cursor, seek, search fan-out, episode list) still need a
+     device pass: no Android device or emulator was attached during this build.
