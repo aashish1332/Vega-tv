@@ -115,6 +115,7 @@ import tv.vega.tv.data.net.NetClients
 import tv.vega.tv.data.model.VegaStream
 import tv.vega.tv.data.model.identityKey
 import tv.vega.tv.player.MatroskaCueDataSource
+import tv.vega.tv.player.ParallelRangeDataSource
 import tv.vega.tv.player.PlaybackSession
 import tv.vega.tv.player.PlayerKeyBus
 import tv.vega.tv.player.createDrmSessionManager
@@ -392,12 +393,21 @@ fun PlayerScreen(
                     .createDataSource()
         }
     }
+    // A very large progressive file (an 80+ GB 4K remux averages ~90 Mbps) can
+    // outrun one TCP connection even when the link has more capacity. This
+    // source starts as the normal request, measures the first four seconds of
+    // reads, and only when that rate cannot carry a remux does it continue over
+    // ordered 1->4 MB range chunks on up to three connections. It sits *below*
+    // the Matroska wrapper so the cue/header probes above stay single-request;
+    // anything that is not a known 4 GiB+ file with proven range support (HLS
+    // segments, sidecar subtitles, small MP4s) passes through untouched.
+    val parallelHttp = remember { ParallelRangeDataSource.Factory(headerHttp) }
     // Matroska files whose Cues are reachable only through a chained SeekHead
     // make Media3 report the stream as unseekable, and every seek then restarts
     // playback at 0:00. This wrapper rewrites that one SeekEntry in flight;
     // HLS/MP4 and every non-Matroska source pass through untouched.
     // `treatAsMatroska` is set from the provider's declared type before prepare.
-    val matroskaHttp = remember { MatroskaCueDataSource.Factory(headerHttp) }
+    val matroskaHttp = remember { MatroskaCueDataSource.Factory(parallelHttp) }
     // Per-stream DRM. Media3 asks this provider once per media item; the map
     // is written immediately before setMediaItem, so a DRM configuration can
     // never leak from one server to the next (or to a clear stream).
