@@ -86,6 +86,12 @@ stack changes, plus the new source file.
       probe code (`classes13.dex`, verified by string search).
 - [x] Permissions unchanged: INTERNET, ACCESS_NETWORK_STATE, WAKE_LOCK,
       REQUEST_INSTALL_PACKAGES.
+- [x] Published: https://github.com/aashish1332/Vega-tv/releases/tag/v1.1.5
+      (`app-debug.apk`). GitHub reports the stored asset as 23,720,177 bytes
+      with digest `sha256:fc2e95715aedd9cac8fa4884b0fd747a8e0f1b91a7c8f999fb12bbeb2926a5b4`,
+      matching the local build byte for byte. (A direct download from the
+      release CDN timed out from this network, so the API digest — computed by
+      GitHub from the uploaded bytes — is the verification.)
 
 ### Device test (still required)
 
