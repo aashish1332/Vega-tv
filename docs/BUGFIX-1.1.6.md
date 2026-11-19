@@ -21,7 +21,7 @@ marked [B] only after the user's device test.
 7. [x] WAF: keep the focused field inside a fixed visible band.
 8. [x] Compile-verify both modules.
 9. [x] Bump to 1.1.6, build the APK, verify size/version/signature/digest.
-10. [ ] Commit, tag, publish the release.
+10. [x] Commit, tag, publish the release.
 
 ## 1. Evidence
 
@@ -137,6 +137,9 @@ Verified build:
   `5595d8d09c8b7e8cd9b261fb583a844889ec2957d23ee6e98ebefdc1d3b22252`.
 - DEX contains `VegaParallelStream` and `Parallel %dx range` in
   `classes13.dex`, and `__wafFocus` / `__vegaEditingBridge` in `classes7.dex`.
+- Release: https://github.com/aashish1332/Vega-tv/releases/tag/v1.1.6 — the
+  uploaded asset reports the same size (23,652,786) and SHA-256
+  (`4fcf7bf4…e8eb9`) as the local build.
 
 ## Device test for 1.1.6
 
