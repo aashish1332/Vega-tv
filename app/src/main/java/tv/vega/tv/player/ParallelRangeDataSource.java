@@ -23,47 +23,49 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Plays large progressive HTTP files over a few parallel range requests when one connection cannot
- * carry the bitrate, for servers that limit the speed of each connection.
+ * Plays large progressive HTTP files over a few parallel range requests.
  *
- * <p>The source starts as a normal single request. The first four seconds of reads measure how fast
- * that connection delivers. Only when the rate is below {@link #SLOW_BYTES_PER_SECOND}, the file is
- * at least {@link #MIN_FILE_BYTES} long and the server has proven byte-range support, does it
- * switch, at the current byte, to downloading the next chunks in order over up to
- * {@link #MAX_CONNECTIONS} connections. The player still receives the bytes strictly in order.
+ * <p>An 80+ GB 4K remux averages about 90 Mbps and peaks well above it. A host
+ * that shapes a single connection, or one that only gives a fast link over
+ * several sockets, cannot keep the player's forward buffer full from one
+ * request. This source therefore opens the file once, proves byte-range
+ * support, and then continues over ordered chunks on up to four connections.
  *
- * <p>To stay light on the server: chunks start at 1 MB so playback starts quickly, then grow to
- * 4 MB; only a small window ahead of the player is fetched, so nothing is requested while the
- * player's buffer is full; a 429 or 503 permanently lowers the connection count for that host; and
- * a server that ignores ranges, or any repeated failure, returns this source to a single normal
- * request.
+ * <p>Engagement is deterministic for a file whose proven size is at least
+ * {@link #MIN_FILE_BYTES}: there is no speed measurement and no "only when
+ * slow" gate, because both can silently keep a film on one connection (a fast
+ * first response, a missing {@code Accept-Ranges} header, or a chunked
+ * response). Chunks start at 1 MB so playback starts quickly, then grow to
+ * 4 MB. Only a small window ahead of the player is fetched, so nothing is
+ * requested while the player's buffer is full.
  *
- * <p>Ported from the official client's {@code ParallelDataSource}. The only behavioural changes
- * are the bitrate-scale switch, the 4 GiB file gate and the smaller 3 x 4 MB window, so total
- * memory stays well inside the media buffer budget computed in {@code PlayerScreen}.
+ * <p>The single request, the range probe and every fallback use the caller's
+ * normal header-aware factory. Chunks use a second factory built on an
+ * HTTP/1.1-only client: concurrent requests to the same host then occupy
+ * separate sockets instead of being multiplexed onto one HTTP/2 connection,
+ * which is the whole point of a parallel range download.
+ *
+ * <p>A 429 or 503 permanently lowers the connection count for that host; a
+ * server that ignores a range is marked unsuitable and the open falls back to
+ * one request. Query strings are never logged.
  */
 public final class ParallelRangeDataSource implements DataSource {
     private static final String TAG = "VegaParallelStream";
 
-    static final int MAX_CONNECTIONS = 3;
+    static final int MAX_CONNECTIONS = 4;
     /**
-     * Below this a single connection is not a safe carrier for a 4K remux. 16 MB/s is 128 Mbps;
-     * an 80 GB two hour film averages ~89 Mbps and peaks higher, so a connection near this rate
-     * cannot keep the forward buffer full through normal jitter.
+     * Only files this large are supported over parallel ranges. A 4 GiB file
+     * is already a full-length film; smaller opens are segments, subtitles,
+     * indexes or sidecars and must stay single-request.
      */
-    static final long SLOW_BYTES_PER_SECOND = 16_000_000L;
-    /** Time this connection must spend blocked in read() before its rate is trusted. */
-    private static final long MEASURE_MIN_NANOS = 4_000_000_000L;
-    private static final long MEASURE_MIN_BYTES = 512 * 1024L;
-    /** Only files this large are worth extra connections; excludes segments and sidecars. */
     private static final long MIN_FILE_BYTES = 4L * 1024 * 1024 * 1024;
     private static final int FIRST_CHUNK_BYTES = 1024 * 1024;
     private static final int MAX_CHUNK_BYTES = 4 * 1024 * 1024;
     /** Not worth extra connections for the last part of a file or for small reads. */
     private static final long MIN_PARALLEL_BYTES = 16 * 1024 * 1024L;
     /**
-     * Until the player has read this much from an open, only two chunks run. The player also opens
-     * the file to read indexes near the end, then seeks away; this keeps those opens cheap.
+     * Until the player has read this much from an open, only two chunks run.
+     * This keeps an index/header open cheap even when it is unbounded.
      */
     private static final long CONFIRM_PLAYBACK_BYTES = 512 * 1024L;
     private static final int READ_BUFFER_BYTES = 64 * 1024;
@@ -73,7 +75,7 @@ public final class ParallelRangeDataSource implements DataSource {
     private static final long RATE_LIMIT_BURST_MS = 3000;
     private static final int MAX_REOPEN_ATTEMPTS = 4;
 
-    /** Per URL: switched to parallel, or found unsuitable. */
+    /** Per URL: range support proven, or found unsuitable. */
     private static final Map<String, UrlState> URL_STATES = new ConcurrentHashMap<>();
     /** Per host: connections allowed; lowered by each 429 or 503. */
     private static final Map<String, AtomicInteger> HOST_LIMITS = new ConcurrentHashMap<>();
@@ -85,14 +87,16 @@ public final class ParallelRangeDataSource implements DataSource {
     });
 
     private static final class UrlState {
-        volatile boolean parallel;
         volatile boolean unsuitable;
         /** The server has answered a byte range with a 206 for this file. */
         volatile boolean rangeProven;
         volatile long totalLength = C.LENGTH_UNSET;
+        /** Avoids repeating the same log line on every seek within one file. */
+        volatile String lastDecision = "";
     }
 
-    private final DataSource.Factory upstreamFactory;
+    private final DataSource.Factory singleFactory;
+    private final DataSource.Factory chunkFactory;
     private final DataSource single;
     private final List<TransferListener> transferListeners = new ArrayList<>();
 
@@ -102,14 +106,15 @@ public final class ParallelRangeDataSource implements DataSource {
     private long position;
     /** Exclusive end of the open range, or LENGTH_UNSET. */
     private long endPosition;
+    private long totalLength = C.LENGTH_UNSET;
+    /** The first response's headers, kept after the single request is closed. */
+    private Map<String, List<String>> responseHeaders = Collections.emptyMap();
 
-    private boolean measuring;
-    private long measuredBytes;
-    private long measuredNanos;
-
-    private ParallelRangeDataSource(DataSource.Factory upstreamFactory) {
-        this.upstreamFactory = upstreamFactory;
-        this.single = upstreamFactory.createDataSource();
+    private ParallelRangeDataSource(
+            DataSource.Factory singleFactory, DataSource.Factory chunkFactory) {
+        this.singleFactory = singleFactory;
+        this.chunkFactory = chunkFactory;
+        this.single = singleFactory.createDataSource();
     }
 
     @Override
@@ -120,44 +125,186 @@ public final class ParallelRangeDataSource implements DataSource {
 
     @Override
     public long open(DataSpec dataSpec) throws IOException {
+        // Media3 closes before reopening, but a failed open or a caller that
+        // abandons a source must not leave a socket or a worker behind.
+        if (engine != null || singleOpen) {
+            try {
+                close();
+            } catch (IOException ignored) {
+                // The new open replaces this state entirely.
+            }
+        }
         this.dataSpec = dataSpec;
         position = dataSpec.position;
-        measuring = false;
-        measuredBytes = 0;
-        measuredNanos = 0;
+        endPosition = C.LENGTH_UNSET;
+        totalLength = C.LENGTH_UNSET;
+        responseHeaders = Collections.emptyMap();
 
-        UrlState state = suitable(dataSpec) ? urlState(dataSpec.uri) : null;
-        if (state != null && state.parallel && state.totalLength > 0) {
+        boolean eligible = suitable(dataSpec);
+        UrlState state = eligible ? urlState(dataSpec.uri) : null;
+
+        // One normal request discovers the size and, at position 0, costs one
+        // response. It is also the source that playback falls back to.
+        singleOpen = true;
+        long length;
+        try {
+            length = single.open(dataSpec);
+        } catch (IOException error) {
+            singleOpen = false;
+            throw error;
+        }
+        responseHeaders = single.getResponseHeaders();
+
+        if (state != null) {
+            length = inspectOpen(state, length);
+        }
+        if (totalLength > 0) {
+            endPosition = dataSpec.length == C.LENGTH_UNSET
+                    ? totalLength
+                    : Math.min(totalLength, position + dataSpec.length);
+        } else if (length != C.LENGTH_UNSET) {
+            endPosition = position + length;
+        }
+
+        if (state != null && !state.unsuitable && state.rangeProven
+                && state.totalLength >= MIN_FILE_BYTES) {
+            long total = state.totalLength;
             long end = dataSpec.length == C.LENGTH_UNSET
-                    ? state.totalLength
-                    : dataSpec.position + dataSpec.length;
+                    ? total
+                    : Math.min(total, position + dataSpec.length);
             int limit = hostLimit(dataSpec.uri).get();
             if (limit > 1 && end - position >= MIN_PARALLEL_BYTES) {
                 endPosition = end;
+                closeSingleQuietly();
                 engine = new Engine(dataSpec, position, end, state);
+                logDecision(state, "parallel", String.format(Locale.US,
+                        "Parallel %dx range: host=%s total=%.1f GB from=%.1f GB",
+                        limit, host(dataSpec.uri), total / 1e9, position / 1e9));
                 return end - position;
             }
-        }
-
-        // A failed open still needs close() to release the upstream's open state.
-        singleOpen = true;
-        long length = single.open(dataSpec);
-        endPosition = length == C.LENGTH_UNSET ? C.LENGTH_UNSET : position + length;
-        // Measure only an open that reads to the end of a known, genuinely large file on a
-        // server that supports byte ranges, so a switch can continue exactly where it left off.
-        measuring = state != null
-                && dataSpec.length == C.LENGTH_UNSET
-                && length != C.LENGTH_UNSET
-                && length >= MIN_FILE_BYTES
-                && hostLimit(dataSpec.uri).get() > 1;
-        if (measuring) {
-            state.totalLength = endPosition;
-            if (!state.rangeProven) {
-                state.rangeProven =
-                        supportsRanges(single.getResponseHeaders(), position, endPosition);
+            logDecision(state, limit <= 1 ? "single-host" : "single-tail",
+                    String.format(Locale.US,
+                            "Single: host=%s total=%.1f GB remaining=%.1f MB limit=%d "
+                                    + "(too short to parallelise)",
+                            host(dataSpec.uri), total / 1e9,
+                            (end - position) / 1e6, limit));
+        } else if (state != null) {
+            String key;
+            if (state.unsuitable) {
+                key = "single-norange";
+            } else if (state.totalLength > 0 && state.totalLength < MIN_FILE_BYTES) {
+                // Every HLS segment and every small sidecar down here would
+                // otherwise log one line per URL. There is no decision to
+                // report for a file that can never reach the threshold.
+                return length;
+            } else {
+                key = "single-unknown";
             }
+            logDecision(state, key, String.format(Locale.US,
+                    "Single: host=%s total=%s ranges=%s from=%.1f GB "
+                            + "(parallel range requests not used)",
+                    host(dataSpec.uri),
+                    state.totalLength > 0
+                            ? String.format(Locale.US, "%.1f GB", state.totalLength / 1e9)
+                            : "unknown",
+                    state.rangeProven ? "proven" : "not honoured",
+                    position / 1e9));
         }
         return length;
+    }
+
+    /**
+     * Turns the first response into a total size and a range decision.
+     *
+     * <p>A 206 proves ranges and carries the total. A 200 at position 0 is the
+     * normal whole-file response; a byte-0 probe then proves ranges without
+     * ever asking Media3 to skip a position inside {@code open()}. A 200 at a
+     * non-zero position means the server ignored the range (and Media3 has
+     * already skipped those bytes), so that URL must stay single.
+     *
+     * @return the length to report to the caller, corrected when a 206 omitted
+     *     {@code Content-Length}
+     */
+    private long inspectOpen(UrlState state, long length) {
+        if (state.unsuitable) {
+            return length;
+        }
+        long[] range = parseContentRange(single.getResponseHeaders());
+        if (range != null) {
+            state.rangeProven = true;
+            state.totalLength = range[2];
+            totalLength = range[2];
+            return length == C.LENGTH_UNSET ? range[2] - position : length;
+        }
+        if (length != C.LENGTH_UNSET) {
+            totalLength = position + length;
+            state.totalLength = totalLength;
+        }
+        if (position > 0) {
+            state.unsuitable = true;
+            return length;
+        }
+        if (state.rangeProven) {
+            return length;
+        }
+        if (totalLength > 0 && totalLength < MIN_FILE_BYTES) {
+            // The size is already known and too small to parallelise. HLS
+            // segments land here on every open; probing them would double the
+            // request count for a stream that can never switch.
+            return length;
+        }
+        long probed = probeRangeTotal(state);
+        if (probed > 0) {
+            state.rangeProven = true;
+            state.totalLength = probed;
+            totalLength = probed;
+        }
+        return length;
+    }
+
+    /**
+     * Proves range support with one byte at the start of the file.
+     *
+     * <p>Starting at byte 0 is deliberate: Media3's HTTP source answers a 200
+     * to a non-zero range by reading and discarding every preceding byte inside
+     * {@code open()}, so a probe at the current (possibly tens-of-GB) position
+     * could download the whole film before returning. From byte 0 that skip is
+     * zero, and a range-ignoring server costs one response.
+     *
+     * @return the file's total size, or {@link C#LENGTH_UNSET}
+     */
+    private long probeRangeTotal(UrlState state) {
+        DataSpec spec = dataSpec;
+        if (spec == null) {
+            return C.LENGTH_UNSET;
+        }
+        DataSource probe = singleFactory.createDataSource();
+        try {
+            probe.open(spec.buildUpon().setPosition(0).setLength(1L).build());
+            long[] range = parseContentRange(probe.getResponseHeaders());
+            if (range != null && range[0] == 0 && range[2] > 0) {
+                return range[2];
+            }
+            // A 200 to a one-byte range is definitive: this URL cannot continue
+            // at an arbitrary byte, so it must never switch to chunks.
+            state.unsuitable = true;
+            return C.LENGTH_UNSET;
+        } catch (HttpDataSource.InvalidResponseCodeException error) {
+            if (error.responseCode == 416 || error.responseCode == 405) {
+                state.unsuitable = true;
+            }
+            // Any other status (429, 503, a transient 5xx) must not disable
+            // parallel playback for the whole session.
+            return C.LENGTH_UNSET;
+        } catch (IOException error) {
+            return C.LENGTH_UNSET;
+        } finally {
+            try {
+                probe.close();
+            } catch (IOException ignored) {
+                // The probe result is already decided.
+            }
+        }
     }
 
     @Override
@@ -179,83 +326,11 @@ public final class ParallelRangeDataSource implements DataSource {
                 reopenSingle();
             }
         }
-
-        // Time only what the connection spends blocked in read(): that is network time. Wall-clock
-        // time would include the player's long pauses while the forward buffer is full, which
-        // would report a fast link as slow. In-read time is what the official source trusts; the
-        // only bias is the small amount of data the socket buffers during a pause, which makes a
-        // link look faster, never slower.
-        long started = measuring ? System.nanoTime() : 0;
         int read = single.read(buffer, offset, length);
         if (read > 0) {
             position += read;
-            if (measuring) {
-                measuredBytes += read;
-            }
-        }
-        if (measuring && read > 0) {
-            measuredNanos += System.nanoTime() - started;
-            if (measuredNanos >= MEASURE_MIN_NANOS && measuredBytes >= MEASURE_MIN_BYTES) {
-                measuring = false;
-                maybeSwitchToParallel();
-            }
         }
         return read;
-    }
-
-    private void maybeSwitchToParallel() {
-        long bytesPerSecond = measuredBytes * 1_000_000_000L / Math.max(1, measuredNanos);
-        DataSpec spec = dataSpec;
-        if (spec == null
-                || bytesPerSecond >= SLOW_BYTES_PER_SECOND
-                || endPosition - position < MIN_PARALLEL_BYTES) {
-            return;
-        }
-        UrlState state = urlState(spec.uri);
-        if (!state.rangeProven && !probeRanges(spec, state)) {
-            return;
-        }
-        state.parallel = true;
-        Log.i(TAG, String.format(Locale.US,
-                "One connection gives %d KB/s over %d ms; using parallel range requests",
-                bytesPerSecond / 1024, measuredNanos / 1_000_000L));
-        closeSingleQuietly();
-        engine = new Engine(spec, position, endPosition, state);
-    }
-
-    /**
-     * Proves that the server honours a byte range when the first response did not advertise it.
-     *
-     * <p>The probe always starts at byte 0 on purpose: Media3's HTTP source answers a 200 to a
-     * non-zero range by reading and discarding every byte before the requested position, so a
-     * probe at the current (possibly tens-of-GB) position could download the whole film before it
-     * returned. From byte 0 that skip is zero, and a range-ignoring server costs one response.
-     */
-    private boolean probeRanges(DataSpec spec, UrlState state) {
-        DataSource probe = upstreamFactory.createDataSource();
-        try {
-            probe.open(spec.buildUpon().setPosition(0).setLength(1L).build());
-            long[] range = parseContentRange(probe.getResponseHeaders());
-            boolean proven = range != null
-                    && range[0] == 0
-                    && range[1] == 0
-                    && range[2] == endPosition;
-            if (!proven) {
-                state.unsuitable = true;
-                Log.i(TAG, "Server does not honour byte ranges; keeping one connection");
-            }
-            return proven;
-        } catch (IOException error) {
-            // A transient failure must not disable parallel playback for good.
-            Log.i(TAG, "Range probe failed: " + error.getMessage());
-            return false;
-        } finally {
-            try {
-                probe.close();
-            } catch (IOException ignored) {
-                // The probe result is already decided.
-            }
-        }
     }
 
     /** Continues the open range from the current byte over one normal request. */
@@ -299,7 +374,7 @@ public final class ParallelRangeDataSource implements DataSource {
 
     @Override
     public Map<String, List<String>> getResponseHeaders() {
-        return singleOpen ? single.getResponseHeaders() : Collections.emptyMap();
+        return responseHeaders;
     }
 
     @Override
@@ -309,7 +384,7 @@ public final class ParallelRangeDataSource implements DataSource {
             engine = null;
         }
         dataSpec = null;
-        measuring = false;
+        responseHeaders = Collections.emptyMap();
         if (singleOpen) {
             singleOpen = false;
             single.close();
@@ -368,6 +443,19 @@ public final class ParallelRangeDataSource implements DataSource {
         return limit;
     }
 
+    private static String host(Uri uri) {
+        String host = uri.getHost();
+        return host == null || host.isEmpty() ? "unknown" : host;
+    }
+
+    private static void logDecision(UrlState state, String key, String message) {
+        if (key.equals(state.lastDecision)) {
+            return;
+        }
+        state.lastDecision = key;
+        Log.i(TAG, message);
+    }
+
     /**
      * Lowers a host's connection limit to the number of requests still working, never below
      * {@code floor}. Written as a CAS loop because {@code AtomicInteger.updateAndGet} only exists
@@ -381,32 +469,6 @@ public final class ParallelRangeDataSource implements DataSource {
                 return next;
             }
         }
-    }
-
-    /**
-     * True when a response to an open that reads to the end shows the server supports ranges: a
-     * 206 for exactly the requested bytes or, for a request from byte 0 that sends no Range
-     * header, Accept-Ranges: bytes. Each chunk is checked again, so a wrong answer here only costs
-     * one failed chunk before falling back.
-     */
-    private static boolean supportsRanges(
-            Map<String, List<String>> headers, long start, long end) {
-        long[] range = parseContentRange(headers);
-        if (range != null) {
-            return range[0] == start && range[1] == end - 1 && range[2] == end;
-        }
-        if (start != 0) {
-            return false;
-        }
-        for (Map.Entry<String, List<String>> entry : headers.entrySet()) {
-            if (entry.getKey() != null
-                    && entry.getKey().equalsIgnoreCase("Accept-Ranges")
-                    && !entry.getValue().isEmpty()
-                    && entry.getValue().get(0).trim().equalsIgnoreCase("bytes")) {
-                return true;
-            }
-        }
-        return false;
     }
 
     /**
@@ -583,7 +645,10 @@ public final class ParallelRangeDataSource implements DataSource {
         }
 
         private void download(Chunk chunk) {
-            DataSource source = upstreamFactory.createDataSource();
+            // Chunks use the HTTP/1.1 client: concurrent ranges must be separate
+            // sockets. An HTTP/2 client would multiplex them onto one connection,
+            // which defeats per-connection shaping on the server.
+            DataSource source = chunkFactory.createDataSource();
             for (TransferListener listener : transferListeners) {
                 source.addTransferListener(listener);
             }
@@ -604,7 +669,6 @@ public final class ParallelRangeDataSource implements DataSource {
                 if (!isChunkRange(source.getResponseHeaders(), from, chunk.end(), state.totalLength)) {
                     // A server that ignores ranges would send the whole file for every chunk.
                     state.unsuitable = true;
-                    state.parallel = false;
                     fail("server ignored the byte range");
                     return;
                 }
@@ -681,7 +745,6 @@ public final class ParallelRangeDataSource implements DataSource {
                     int limit = lowerHostLimit(hostLimit, floor, working);
                     Log.i(TAG, "Server answered " + status + "; connection limit now " + limit);
                     if (limit <= 1) {
-                        state.parallel = false;
                         fail("server limits connections");
                         return;
                     }
@@ -713,17 +776,19 @@ public final class ParallelRangeDataSource implements DataSource {
         }
     }
 
-    /** Wraps an upstream factory; each source decides per open whether to use parallel requests. */
+    /** Wraps two factories; each source decides per open whether to use parallel requests. */
     public static final class Factory implements DataSource.Factory {
-        private final DataSource.Factory upstreamFactory;
+        private final DataSource.Factory singleFactory;
+        private final DataSource.Factory chunkFactory;
 
-        public Factory(DataSource.Factory upstreamFactory) {
-            this.upstreamFactory = upstreamFactory;
+        public Factory(DataSource.Factory singleFactory, DataSource.Factory chunkFactory) {
+            this.singleFactory = singleFactory;
+            this.chunkFactory = chunkFactory;
         }
 
         @Override
         public DataSource createDataSource() {
-            return new ParallelRangeDataSource(upstreamFactory);
+            return new ParallelRangeDataSource(singleFactory, chunkFactory);
         }
     }
 }

@@ -366,21 +366,21 @@ fun PlayerScreen(
             .setPreferredAudioLanguages(*preferredAudioCodes(audioLanguage))
             .build()
     }
-    // Header-aware HTTP stack: the factory reads currentHeaders on every
-    // request, so per-stream provider auth applies to media + segments.
+    // Header-aware HTTP stack: the factory reads the current header snapshot on
+    // every request, so per-stream provider auth applies to media + segments.
     //
     // This is OkHttp rather than the platform URLConnection stack because a
     // film makes hundreds of segment/range requests: OkHttp keeps the TLS
-    // connection and HTTP/2 stream alive between them. The platform stack
-    // re-handshakes far more often, which is exactly what turns a 1080p HLS
-    // stream into periodic 2–4s stalls on a weak TV SoC. It also routes media
-    // through the same DoH resolver the rest of the app already uses.
-    val headerHttp = remember {
+    // connection and (for HLS) the HTTP/2 stream alive between them. The
+    // platform stack re-handshakes far more often, which is exactly what turns
+    // a 1080p HLS stream into periodic 2–4s stalls on a weak TV SoC.
+    val mediaHeaders = remember {
+        java.util.concurrent.atomic.AtomicReference<Map<String, String>>(emptyMap())
+    }
+    fun mediaFactory(client: okhttp3.OkHttpClient): DataSource.Factory =
         object : DataSource.Factory {
-            @Volatile
-            var headers: Map<String, String> = emptyMap()
             override fun createDataSource(): DataSource =
-                OkHttpDataSource.Factory(NetClients.http)
+                OkHttpDataSource.Factory(client)
                     .setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0")
                     // Merged, not overwritten: a second setDefaultRequestProperties
                     // call replaces the first, which would silently drop every
@@ -388,20 +388,31 @@ fun PlayerScreen(
                     .setDefaultRequestProperties(
                         // Cookies are provider credentials too. Dropping them
                         // makes otherwise valid signed/HLS servers return 403.
-                        headers + ("Accept" to "*/*"),
+                        mediaHeaders.get() + ("Accept" to "*/*"),
                     )
                     .createDataSource()
         }
+    val headerHttp = remember { mediaFactory(NetClients.http) }
+    // Chunk downloads must be genuinely separate sockets. On the shared
+    // HTTP/2 client, "four connections" is four multiplexed streams on one TCP
+    // connection, so a server that shapes each connection still starves the
+    // film. The HTTP/1.1-only client reuses the same pool, headers, cookies
+    // and DoH resolver but negotiates a fresh HTTP/1.1 connection per
+    // concurrent range request.
+    val rangeChunkHttp = remember {
+        mediaFactory(
+            NetClients.http.newBuilder()
+                .protocols(listOf(okhttp3.Protocol.HTTP_1_1))
+                .build(),
+        )
     }
     // A very large progressive file (an 80+ GB 4K remux averages ~90 Mbps) can
-    // outrun one TCP connection even when the link has more capacity. This
-    // source starts as the normal request, measures the first four seconds of
-    // reads, and only when that rate cannot carry a remux does it continue over
-    // ordered 1->4 MB range chunks on up to three connections. It sits *below*
-    // the Matroska wrapper so the cue/header probes above stay single-request;
-    // anything that is not a known 4 GiB+ file with proven range support (HLS
-    // segments, sidecar subtitles, small MP4s) passes through untouched.
-    val parallelHttp = remember { ParallelRangeDataSource.Factory(headerHttp) }
+    // outrun one TCP connection even when the link has more capacity. Once the
+    // first response proves a 4 GiB+ file supports ranges, this source
+    // continues over ordered 1->4 MB chunks on up to four HTTP/1.1 sockets. It
+    // sits *below* the Matroska wrapper so the cue/header probes above stay
+    // single-request; HLS segments, sidecars and small MP4s pass untouched.
+    val parallelHttp = remember { ParallelRangeDataSource.Factory(headerHttp, rangeChunkHttp) }
     // Matroska files whose Cues are reachable only through a chained SeekHead
     // make Media3 report the stream as unseekable, and every seek then restarts
     // playback at 0:00. This wrapper rewrites that one SeekEntry in flight;
@@ -506,7 +517,7 @@ fun PlayerScreen(
     }
     // Swap provider-authorized headers per stream.
     fun dataSourceWith(headers: Map<String, String>) {
-        headerHttp.headers = headers
+        mediaHeaders.set(headers)
     }
     // Wall-clock, not a coroutine: the listener below is called on the main
     // thread and must not start work of its own.
