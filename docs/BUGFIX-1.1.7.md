@@ -159,6 +159,9 @@ Verified build:
   `DisplayCapability` (classes4/10/13/14).
 - SHA-256
   `6E6F2A06CF0D0B740FB6B53BA8B5BE315BE04C3926B86A369D55F053B226234D`.
+- Released as https://github.com/aashish1332/Vega-tv/releases/tag/v1.1.7
+  (asset `app-debug.apk`). The uploaded asset reports the same size
+  (23,661,668 bytes) and SHA-256.
 
 ## Device test for 1.1.7
 
