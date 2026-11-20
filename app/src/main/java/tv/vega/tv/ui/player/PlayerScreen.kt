@@ -108,6 +108,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.isActive
+import tv.vega.tv.data.DisplayCapability
 import tv.vega.tv.data.ServiceLocator
 import tv.vega.tv.data.diag.DiagLog
 import tv.vega.tv.data.history.WatchEntry
@@ -121,7 +122,9 @@ import tv.vega.tv.player.PlayerKeyBus
 import tv.vega.tv.player.createDrmSessionManager
 import tv.vega.tv.player.drmUnsupportedReason
 import tv.vega.tv.player.playbackErrorMessage
+import tv.vega.tv.player.is4kQuality
 import tv.vega.tv.player.isMovieInfo
+import tv.vega.tv.player.playableQualityLinks
 import tv.vega.tv.player.qualityScore
 import tv.vega.tv.ui.common.UiState
 import tv.vega.tv.ui.common.VegaSpinner
@@ -224,6 +227,13 @@ fun PlayerScreen(
     val displayHeight = displayMetrics.heightPixels.coerceAtLeast(1)
     // Auto-quality reads this before the (slower) provider resolve completes.
     LaunchedEffect(displayHeight) { vm.maxPlaybackHeight = displayHeight }
+    // The panel, not the UI. Fire OS renders at 1080p on a 4K television, so
+    // displayMetrics understate what the screen can show and cannot be used to
+    // decide whether 4K renditions are real choices.
+    val supports4kPanel = remember { DisplayCapability.supports4k(ctx) }
+    val panelLongEdge = remember(supports4kPanel) {
+        DisplayCapability.maxLongEdge(ctx).let { if (it >= 3400) it else 3840 }
+    }
     val state by vm.state.collectAsStateWithLifecycle()
     val wafUrl by vm.wafUrl.collectAsStateWithLifecycle()
     val nextError by vm.nextError.collectAsStateWithLifecycle()
@@ -245,6 +255,30 @@ fun PlayerScreen(
     }
     val sel = streams.getOrNull(vm.selectedIndex) ?: streams.firstOrNull()
     val hasMedia = sel != null
+    // Some providers publish only 4K copies. The Quality tab must still offer
+    // one (otherwise the title cannot be played), so the video-track cap has to
+    // allow that track even on a 1080p panel.
+    val only4kRenditions = remember(streams, sel) {
+        val alternates = PlaybackSession.qualityAlternates
+        val allOffered4k = when {
+            alternates.isNotEmpty() -> alternates.all { is4kQuality(it.label) }
+            streams.isNotEmpty() -> streams.all {
+                streamHeight(it) >= 2000 || is4kQuality(it.quality.orEmpty())
+            }
+            else -> false
+        }
+        // A 4K rendition already playing (a resume saved before the panel
+        // filter existed) must not lose its video track to the 1080p cap.
+        allOffered4k || (sel != null && streamHeight(sel) >= 2000)
+    }
+    val videoWidthCap =
+        if (supports4kPanel || only4kRenditions) maxOf(displayWidth, panelLongEdge) else displayWidth
+    val videoHeightCap =
+        if (supports4kPanel || only4kRenditions) {
+            maxOf(displayHeight, panelLongEdge * 9 / 16)
+        } else {
+            displayHeight
+        }
     // Hindi is the requested default. "auto" clears the preference and lets
     // the source pick; a manual MENU ▸ Audio choice still wins for this stream.
     val audioLanguage by ServiceLocator.settings.audioLanguage
@@ -273,6 +307,8 @@ fun PlayerScreen(
     var statsVideo by remember { mutableStateOf("") }
     var statsAudio by remember { mutableStateOf("") }
     var statsDropped by remember { mutableIntStateOf(0) }
+    // Live data-source decision (single vs parallel) for the Stats overlay.
+    var statsSource by remember { mutableStateOf("one connection") }
     // The seek-burst accumulator must outlive the key-handler effect: that
     // effect is re-keyed the moment the UI shows, and a job owned by it would
     // be cancelled mid-flight — the seek from the very keypress that revealed
@@ -355,14 +391,18 @@ fun PlayerScreen(
                 // HLS masters offer every ladder rung, not just the link the
                 // provider named. Cap adaptive video at the panel's own size;
                 // otherwise ExoPlayer happily pulls a 4K variant on a 1080p TV
-                // and spends the whole film dropping frames.
-                .setMaxVideoSize(displayWidth, displayHeight)
+                // and spends the whole film dropping frames. The cap is the
+                // supported panel mode, not the UI metrics: a 4K television
+                // whose launcher runs at 1080p must still accept a 4K track the
+                // viewer picked deliberately.
+                .setMaxVideoSize(videoWidthCap, videoHeightCap)
                 .setPreferredAudioLanguages(*preferredAudioCodes(audioLanguage))
                 .build()
         }
     }
-    LaunchedEffect(audioLanguage) {
+    LaunchedEffect(audioLanguage, videoWidthCap, videoHeightCap) {
         trackSelector.parameters = trackSelector.buildUponParameters()
+            .setMaxVideoSize(videoWidthCap, videoHeightCap)
             .setPreferredAudioLanguages(*preferredAudioCodes(audioLanguage))
             .build()
     }
@@ -406,12 +446,15 @@ fun PlayerScreen(
                 .build(),
         )
     }
-    // A very large progressive file (an 80+ GB 4K remux averages ~90 Mbps) can
-    // outrun one TCP connection even when the link has more capacity. Once the
-    // first response proves a 4 GiB+ file supports ranges, this source
-    // continues over ordered 1->4 MB chunks on up to four HTTP/1.1 sockets. It
+    // Any progressive video can outrun one TCP connection even when the link
+    // has more capacity: a 300 MB episode on a throttled host behaves exactly
+    // like an 80 GB 4K remux. This source starts with one request, measures how
+    // fast it really delivers, and only then continues over ordered 1->8 MB
+    // chunks on up to four HTTP/1.1 sockets. If parallel requests do not
+    // measurably help, the URL stays single for the rest of the session. It
     // sits *below* the Matroska wrapper so the cue/header probes above stay
-    // single-request; HLS segments, sidecars and small MP4s pass untouched.
+    // single-request; small HLS segments, sidecars and small files pass
+    // untouched.
     val parallelHttp = remember { ParallelRangeDataSource.Factory(headerHttp, rangeChunkHttp) }
     // Matroska files whose Cues are reachable only through a chained SeekHead
     // make Media3 report the stream as unseekable, and every seek then restarts
@@ -465,13 +508,16 @@ fun PlayerScreen(
                     // with a larger heap it buys the extra seconds a 4K HDR
                     // remux needs. Never smaller than 1.1.3.
                     .setTargetBufferBytes(mediaBufferBudgetBytes(ctx))
-                    // min 15s, max 60s, start at 1.5s, resume after a rebuffer
-                    // at 3s. The old 5s resume threshold was harsher than the
-                    // official client's 3s and, at 100 Mbps, required 62 MB —
-                    // the whole 64 MB budget — just to show a frame again.
-                    // 3s resumes in 40% less data and still keeps the stream
-                    // comfortably ahead on the enlarged budget.
-                    .setBufferDurationsMs(15_000, 60_000, 1_500, 3_000)
+                    // Matches the official client: 8s minimum, a very long
+                    // maximum, start at 1.5s, resume after a rebuffer at 3s.
+                    // The 600s ceiling is deliberate: the byte budget is the
+                    // real read-ahead limit (prioritiseTimeOverSizeThresholds
+                    // stays false), and a short 60s ceiling could stop loading
+                    // on a low-bitrate file before that budget was used. The
+                    // old 5s resume threshold was harsher than the official
+                    // 3s and, at 100 Mbps, required 62 MB — the whole 64 MB
+                    // budget — just to show a frame again.
+                    .setBufferDurationsMs(8_000, 600_000, 1_500, 3_000)
                     // No back buffer. ExoPlayer keeps it in the same allocator
                     // as the forward buffer, and its cost is pure bitrate:
                     // 5s is 37 MB at 60 Mbps and 62 MB at 100 Mbps. That ate
@@ -1038,6 +1084,8 @@ fun PlayerScreen(
                     }
                 }.orEmpty()
                 if (aLine != statsAudio) statsAudio = aLine
+                val src = tv.vega.tv.player.ParallelRangeDataSource.diagnostics()
+                if (src != statsSource) statsSource = src
             }
             isPlayingNow = player.isPlaying
             // Continue Watching can enter with no rebuilt episode list; the
@@ -1341,6 +1389,7 @@ fun PlayerScreen(
         statsVideo = statsVideo,
         statsAudio = statsAudio,
         statsDropped = statsDropped,
+        statsSource = statsSource,
         onToggleStats = { statsOpen = !statsOpen; touch() },
         hasNext = hasNext,
         hasPrev = hasPrev,
@@ -1540,6 +1589,7 @@ private fun PlayerChrome(
     statsVideo: String,
     statsAudio: String,
     statsDropped: Int,
+    statsSource: String,
     onToggleStats: () -> Unit,
     hasNext: Boolean,
     hasPrev: Boolean,
@@ -1575,10 +1625,6 @@ private fun PlayerChrome(
     // The frame-rate cap setting, actually applied to the surface below.
     val maxFps by ServiceLocator.settings.maxFps
         .collectAsStateWithLifecycle(initialValue = "auto")
-    // Distinct qualities the provider offered, best first, each mapped to its
-    // best stream: the quality dropdown is the server list minus server names.
-    // Movie quality cards are whole alternate links and are appended.
-    val choices = remember(streams) { qualityChoices(streams) }
     // A Continue Watching resume rebuilds no episode list, so the session's
     // current link lives in `pendingLink` instead. Without this fallback the
     // chip read "Auto" and the Quality tab ticked nothing, even though the
@@ -1587,6 +1633,14 @@ private fun PlayerChrome(
         .getOrNull(PlaybackSession.startIndex)?.link
         ?.takeIf { it.isNotBlank() }
         ?: PlaybackSession.pendingLink
+    // Distinct qualities the provider offered, best first, each mapped to its
+    // best stream: the quality dropdown is the server list minus server names.
+    // Movie quality cards are whole alternate links instead. The playing link
+    // is passed so a 4K rendition already on screen is not hidden by the
+    // panel's 4K filter.
+    val choices = remember(streams, selectedIndex, currentEpLink) {
+        qualityChoices(streams, selectedIndex, currentEpLink)
+    }
     val currentQuality = PlaybackSession.qualityAlternates
         .firstOrNull { it.link == currentEpLink }?.label
         ?: (streams.getOrNull(selectedIndex)?.quality ?: "").trim().ifBlank { "Auto" }
@@ -1809,6 +1863,7 @@ private fun PlayerChrome(
                 speed = speed,
                 resizeMode = resizeMode,
                 serverLabel = serverLabel,
+                source = statsSource,
                 modifier = Modifier.align(Alignment.BottomStart)
                     .padding(start = 28.dp, bottom = if (showUI) 150.dp else 24.dp),
             )
@@ -2471,6 +2526,7 @@ private fun StatsOverlay(
     speed: Float,
     resizeMode: Int,
     serverLabel: String,
+    source: String,
     modifier: Modifier = Modifier,
 ) {
     Column(
@@ -2493,6 +2549,7 @@ private fun StatsOverlay(
             "Dropped frames: $dropped",
             "Speed: ${formatSpeed(speed)} · ${resizeLabel(resizeMode)}",
             "Server: " + serverLabel.ifBlank { "—" },
+            "Source: " + source.ifBlank { "—" },
         )
         lines.forEach {
             Text(
@@ -3037,15 +3094,31 @@ private data class QualityChoice(
  * and pretend the other cards do not exist. Best resolution, then largest file,
  * comes first. Shows have no alternates and keep their stream qualities.
  */
-private fun qualityChoices(streams: List<VegaStream>): List<QualityChoice> {
+private fun qualityChoices(
+    streams: List<VegaStream>,
+    selectedIndex: Int,
+    playingLink: String,
+): List<QualityChoice> {
     val alternates = PlaybackSession.qualityAlternates
     if (alternates.isNotEmpty()) {
-        return alternates
-            .distinctBy { it.link }
+        return playableQualityLinks(alternates.distinctBy { it.link }, playingLink)
             .sortedByDescending { qualityScore(it.label) }
             .map { QualityChoice(it.label, link = it.link) }
     }
-    return qualityOptions(streams).map { (label, i) ->
+    val options = qualityOptions(streams)
+    // A 1080p panel gets only renditions it can actually show. The selected
+    // entry is kept: it is what is playing, and removing it would leave the
+    // tick nowhere. When every rendition is 4K the list is returned unchanged,
+    // because the provider published nothing else to play.
+    val visible = if (DisplayCapability.supports4k()) {
+        options
+    } else {
+        options.filter { (label, i) ->
+            i == selectedIndex ||
+                !(is4kQuality(label) || streamHeight(streams[i]) >= 2000)
+        }.ifEmpty { options }
+    }
+    return visible.map { (label, i) ->
         QualityChoice(label, streamIndex = i)
     }
 }

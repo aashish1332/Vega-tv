@@ -139,6 +139,34 @@ fun qualityTier(label: String): Int {
     }
 }
 
+/**
+ * True for a rendition above 1080p (4K or 8K).
+ *
+ * A 1080p television cannot show it any better than its 1080p copy, so the
+ * pickers hide these unless the panel exposes a 4K display mode.
+ */
+fun is4kQuality(label: String): Boolean = qualityTier(label) >= 5
+
+/**
+ * Provider renditions this panel should offer, best first.
+ *
+ * Hiding every 4K entry would leave a title with no choice at all when the
+ * provider only published 4K copies, so the original list is returned in that
+ * case. [keepLink] is the rendition already playing: it stays visible even when
+ * it is 4K, because a picker that omits what is on screen reads as broken.
+ */
+fun playableQualityLinks(
+    links: List<QualityLink>,
+    keepLink: String = "",
+): List<QualityLink> {
+    if (links.isEmpty() || tv.vega.tv.data.DisplayCapability.supports4k()) return links
+    val visible = links.filterNot { is4kQuality(it.label) }
+    if (visible.isEmpty()) return links
+    if (keepLink.isBlank() || visible.any { it.link == keepLink }) return visible
+    val playing = links.firstOrNull { it.link == keepLink } ?: return visible
+    return (visible + playing).sortedByDescending { qualityScore(it.label) }
+}
+
 /** Size in megabytes named by a card ("80.2GB", "1.4 GiB", "700MB"), or 0. */
 fun qualitySizeMb(label: String): Int {
     val m = Regex("""(\d+(?:[.,]\d+)?)\s*(tb|tib|gb|gib|mb|mib)""", RegexOption.IGNORE_CASE)

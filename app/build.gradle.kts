@@ -13,8 +13,8 @@ android {
         applicationId = "tv.vega.tv"
         minSdk = 21
         targetSdk = 34
-        versionCode = 8
-        versionName = "1.1.6"
+        versionCode = 9
+        versionName = "1.1.7"
     }
 
     buildTypes {

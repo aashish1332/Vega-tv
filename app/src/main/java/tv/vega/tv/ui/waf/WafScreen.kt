@@ -67,7 +67,6 @@ import org.json.JSONObject
 import org.json.JSONTokener
 import tv.vega.tv.data.providers.COMMON_USER_AGENT
 import tv.vega.tv.data.providers.WafCoordinator
-import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.roundToInt
@@ -199,6 +198,8 @@ private val FOCUS_TEXT_FIELD_JS = """
 private val SAVE_SCROLL_JS = """
     (function () {
       window.__vegaScroll = [window.scrollX || 0, window.scrollY || 0, Date.now()];
+      var vh = window.innerHeight || 0;
+      if (vh > (window.__vegaBaseVh || 0)) window.__vegaBaseVh = vh;
       return 'saved';
     })()
 """.trimIndent()
@@ -213,18 +214,30 @@ private val SAVE_SCROLL_JS = """
  * and re-asserts the field's position whenever the page changes size (the IME
  * opening), the value changes, or the caret moves.
  *
- * The visible band starts below the app toolbar and ends at half the viewport.
- * That is above a keyboard covering the lower half whether or not the WebView
- * itself shrank for the IME, so no inset measurement is involved. The target is
- * 38% of the viewport; a field already inside the band is not moved, so typing
- * does not make the page jump on every key.
+ * The band is adaptive. When the WebView itself shrank for the IME (the normal
+ * `adjustResize` / `imePadding` case), the whole layout viewport is already
+ * above the keyboard, so the field only has to avoid the toolbar: 8%–75% with
+ * a 40% target. When the keyboard overlays the page (`FLAG_LAYOUT_NO_LIMITS`,
+ * an IME in its own fullscreen window, or TV firmware that reports no inset),
+ * `innerHeight` did not shrink and the lower half is covered: 6%–40% with a
+ * 25% target. The pre-keyboard height is recorded at page load and before a
+ * tap, so the two cases can be told apart without trusting an inset.
+ *
+ * A field already inside the band is not moved, and a forced pass ignores a
+ * small dead zone around the target, so typing does not make the page jump on
+ * every key or on every resize event.
  */
 private val EDITING_BRIDGE_JS = """
     (function () {
+      // The pre-keyboard viewport. Captured at page load or by SAVE_SCROLL_JS
+      // before a tap; never overwritten by a shrunk (keyboard-up) reading.
+      if (!window.__vegaBaseVh) {
+        window.__vegaBaseVh = window.innerHeight || document.documentElement.clientHeight || 0;
+      }
       if (window.__vegaEditingBridge) {
         // Re-injected by beginEditing or after a document replaced the page.
         report();
-        reveal();
+        reveal(true);
         return;
       }
       window.__vegaEditingBridge = true;
@@ -269,58 +282,95 @@ private val EDITING_BRIDGE_JS = """
       }
       function reportSoon() { setTimeout(report, 0); }
 
-      // A focus move is reported after it settles: moving between two fields
-      // fires focusout then focusin, and only the second state matters.
-      document.addEventListener('focusin', reportSoon, true);
+      // A focus loss is reported after it settles: moving between two fields
+      // fires focusout then focusin, and only the second state matters. The
+      // focusin listener below also reports and forces the field into view.
       document.addEventListener('focusout', reportSoon, true);
 
-      function reveal() {
+      function reveal(force) {
+        var vh = window.innerHeight || document.documentElement.clientHeight || 0;
+        if (vh <= 0) return 'none';
         var el = activeEditable();
-        if (!el) return 'none';
+        if (!el) {
+          // No field owns the keyboard, so this height is the baseline.
+          if (vh > (window.__vegaBaseVh || 0)) window.__vegaBaseVh = vh;
+          return 'none';
+        }
         var saved = window.__vegaScroll;
         window.__vegaScroll = null;
         if (saved && Date.now() - saved[2] < 5000 &&
             Math.abs((window.scrollY || 0) - saved[1]) > 4) {
           window.scrollTo(saved[0] || 0, saved[1] || 0);
         }
-        var vh = window.innerHeight || document.documentElement.clientHeight || 0;
-        if (vh <= 0) return 'none';
+        var base = window.__vegaBaseVh || 0;
+        if (base <= 0 || vh > base) {
+          base = vh;
+          window.__vegaBaseVh = vh;
+        }
+        // A 10% shrink is the keyboard; small height changes are page chrome.
+        var shrank = base > 0 && vh < base * 0.9;
+        var bandTop = vh * (shrank ? 0.08 : 0.06);
+        var bandBottom = vh * (shrank ? 0.75 : 0.40);
+        var targetRatio = shrank ? 0.40 : 0.25;
         var r = el.getBoundingClientRect();
-        var pad = 10;
-        var bandTop = Math.max(pad, vh * 0.12);
-        var bandBottom = vh * 0.50;
-        if (bandBottom < bandTop + r.height) bandBottom = bandTop + r.height;
-        // Only move a field that has left the band. `scrollBy` never changes
-        // the horizontal position, so a page panned sideways stays there.
-        if (r.top >= bandTop && r.bottom <= bandBottom) return 'visible';
-        var target = vh * 0.38 - r.height / 2;
+        if (bandBottom < bandTop + r.height + 20) {
+          bandBottom = bandTop + r.height + 20;
+        }
+        if (bandBottom > vh) bandBottom = vh;
+        var inBand = r.top >= bandTop && r.bottom <= bandBottom;
+        var target = vh * targetRatio - r.height / 2;
         target = Math.max(bandTop, Math.min(target, bandBottom - r.height));
+        // Typing only re-checks the band. A forced pass (focus, IME open,
+        // viewport resize, and the native timed passes) also moves a field
+        // that is technically visible but sits under the keyboard edge.
+        var deadZone = vh * 0.04;
+        if (inBand && (!force || Math.abs(r.top - target) <= deadZone)) {
+          return 'visible';
+        }
+        // `scrollBy` never changes the horizontal position, so a page panned
+        // sideways stays there.
         window.scrollBy(0, r.top - target);
+        // A page that cannot scroll (a fixed layout or a nested scroller) has
+        // not moved; let the browser walk its scroll containers instead.
+        var after = el.getBoundingClientRect();
+        if (after.top < bandTop || after.bottom > bandBottom) {
+          try { el.scrollIntoView({block: 'center', inline: 'nearest'}); }
+          catch (e) { try { el.scrollIntoView(); } catch (e2) {} }
+        }
         return 'revealed';
       }
 
       var pending = 0;
-      function revealSoon() {
+      function revealSoon(force) {
         if (pending) return;
         pending = setTimeout(function () {
           pending = 0;
-          reveal();
+          reveal(force === true);
         }, 80);
       }
 
+      // A focus move is the strongest signal: place the field in the band
+      // before the IME animation starts and again once it has settled.
+      document.addEventListener('focusin', function () {
+        reportSoon();
+        setTimeout(function () { reveal(true); }, 60);
+      }, true);
       // The page can resize the visual viewport when the IME opens, move the
-      // caret itself while typing, or replace the value. Re-assert the band on
-      // those events; a field already inside it does not move.
-      document.addEventListener('input', revealSoon, true);
-      document.addEventListener('selectionchange', revealSoon, true);
-      window.addEventListener('resize', revealSoon);
+      // caret itself while typing, or replace the value. Typing re-checks the
+      // band only; a field already inside it does not move. The native side
+      // also runs forced passes for the first ~2.4s (some TV keyboards report
+      // neither a resize nor a visualViewport event).
+      document.addEventListener('input', function () { revealSoon(false); }, true);
+      document.addEventListener('selectionchange', function () { revealSoon(false); }, true);
+      window.addEventListener('resize', function () { revealSoon(true); });
       if (window.visualViewport) {
-        window.visualViewport.addEventListener('resize', revealSoon);
+        window.visualViewport.addEventListener('resize', function () { revealSoon(true); });
       }
 
-      window.__vegaReveal = reveal;
+      window.__vegaReveal = function () { return reveal(false); };
+      window.__vegaRevealForce = function () { return reveal(true); };
       report();
-      reveal();
+      reveal(true);
     })()
 """.trimIndent()
 
@@ -603,9 +653,6 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
     // a frame or two after hideSoftInput; without this the observer below
     // would immediately re-adopt it and hide the cursor again.
     val imeSuppressedUntil = remember { AtomicLong(0L) }
-    // Invalidates a pending "the field really lost focus" check when focus
-    // lands on another field before that check runs.
-    val focusGeneration = remember { AtomicInteger(0) }
     val toolbarFocus = remember { FocusRequester() }
     val webViewFocus = remember { FocusRequester() }
     // Pointer keys arrive on the WebView's key listener (the page always keeps
@@ -670,15 +717,26 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
      * the cursor suspend consistently instead of only on the tap path.
      */
     fun beginEditing(wv: WebView) {
+        val started = !editing
         editing = true
-        focusGeneration.incrementAndGet()
         pointerOverlay?.visibility = View.GONE
-        wv.showIme()
+        // Record the pre-keyboard viewport before the IME opens. This is what
+        // tells the page whether the WebView is about to shrink (keyboard is
+        // outside it) or the keyboard will overlay the page.
+        if (started) {
+            runCatching {
+                wv.evaluateJavascript(
+                    "window.__vegaBaseVh=Math.max(window.__vegaBaseVh||0,window.innerHeight||0);'saved'",
+                    null,
+                )
+            }
+        }
+        wv.postDelayed({ if (editing) wv.showIme() }, 16)
         // A page can focus a field before onPageFinished has installed the
         // bridge. Injecting here is idempotent and immediately reports the
         // current focus and re-asserts the field's band position.
         runCatching { wv.evaluateJavascript(EDITING_BRIDGE_JS, null) }
-        status = "Keyboard open — type, then press BACK to close it"
+        if (started) status = "Keyboard open — type, then press BACK to close it"
     }
 
     /**
@@ -716,28 +774,6 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
                 }
             }
         }
-    }
-
-    /**
-     * A DOM focusout is not always the end of editing: moving between two
-     * fields fires focusout before the next focusin. Re-check the active
-     * element after the event loop has settled; another field keeps editing
-     * alive, a button or the body closes it.
-     */
-    fun scheduleEndEditingIfBlurred(wv: WebView) {
-        val generation = focusGeneration.incrementAndGet()
-        wv.postDelayed({
-            if (!editing || focusGeneration.get() != generation) return@postDelayed
-            runCatching {
-                wv.evaluateJavascript(ACTIVE_TEXT_FIELD_JS) { result ->
-                    if (focusGeneration.get() == generation &&
-                        result?.contains("editable") != true
-                    ) {
-                        endEditing()
-                    }
-                }
-            }
-        }, 250)
     }
 
     fun focusFirstTextField() {
@@ -1064,51 +1100,45 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
         if (Build.VERSION.SDK_INT >= 30 || imeBottomPx > 0) 0 else legacyImePx
 
     // The IME opens at its own pace and the WebView height settles over
-    // several frames. The bridge also re-reveals on resize and input, but a
-    // short series of passes covers a slow TV keyboard that reports neither.
+    // several frames. The bridge re-reveals on resize/input, but a slow TV
+    // keyboard can report neither, so force the active field into the band for
+    // ~2.4s. While the page still reports an editable, also re-assert the IME:
+    // a page that re-renders an input can drop the input connection and the
+    // keyboard would otherwise close under the viewer's hands. Once editing
+    // ends (BACK/MENU) this loop stops; nothing here ever hides the IME.
     LaunchedEffect(editing, webView) {
         val wv = webView ?: return@LaunchedEffect
         if (!editing) return@LaunchedEffect
-        repeat(6) { pass ->
-            delay(if (pass == 0) 80L else 320L)
+        repeat(12) { pass ->
+            delay(if (pass == 0) 80L else 220L)
             if (!editing) return@LaunchedEffect
-            wv.evaluateJavascript("window.__vegaReveal&&window.__vegaReveal()", null)
+            wv.evaluateJavascript(
+                "window.__vegaRevealForce&&window.__vegaRevealForce()",
+                null,
+            )
+            if (pass < 10) {
+                wv.evaluateJavascript(ACTIVE_TEXT_FIELD_JS) { result ->
+                    if (editing && result?.contains("editable") == true) wv.showIme()
+                }
+            }
         }
     }
 
     // The keyboard is not only opened by our tap probe: a page can focus a
     // field itself on load. This observer adopts an IME it can actually see.
-    // It ends editing only when a keyboard it previously saw has disappeared.
-    // A negative reading from a keyboard it never saw proves nothing: on TV
-    // firmware and under FLAG_LAYOUT_NO_LIMITS imeVisible() is often false
-    // while the IME is visibly up, and the old 2.4s timeout then called
-    // endEditing() and really hid the keyboard the viewer was typing on.
+    // It never ends editing, because on TV firmware and under
+    // FLAG_LAYOUT_NO_LIMITS imeVisible() is often false while the IME is
+    // visibly up; the old "seen then unseen" path then called endEditing() and
+    // really hid the keyboard the viewer was typing on. Only BACK/MENU closes
+    // the keyboard; the page's own activity is tracked by DOM focus.
     LaunchedEffect(webView) {
         val wv = webView ?: return@LaunchedEffect
-        var sawIme = false
-        var hiddenChecks = 0
         while (true) {
             delay(300)
-            if (!editing) {
-                sawIme = false
-                hiddenChecks = 0
-                if (wv.imeVisible() &&
-                    SystemClock.uptimeMillis() > imeSuppressedUntil.get()
-                ) {
-                    beginEditing(wv)
-                    sawIme = true
-                }
-                continue
-            }
-            if (wv.imeVisible()) {
-                sawIme = true
-                hiddenChecks = 0
-            } else if (sawIme && ++hiddenChecks >= 2) {
-                // The same keyboard this side saw is now gone (system hide or
-                // the IME's own down button). Return the remote to the page.
-                endEditing()
-                sawIme = false
-                hiddenChecks = 0
+            if (!editing && wv.imeVisible() &&
+                SystemClock.uptimeMillis() > imeSuppressedUntil.get()
+            ) {
+                beginEditing(wv)
             }
         }
     }
@@ -1345,24 +1375,41 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
                                         // Page navigation found a text field.
                                         // Go through beginEditing so the
                                         // cursor suspends here too, not only
-                                        // on the tap path.
-                                        post { beginEditing(self) }
+                                        // on the tap path. While editing the
+                                        // bridge is already installed and the
+                                        // IME is up; re-entering would just
+                                        // reinject it on every key repeat.
+                                        post { if (!editing) beginEditing(self) }
                                         return
                                     }
                                     if (obj.has("__wafFocus")) {
                                         // DOM focus is the reliable keyboard
-                                        // state; the IME inset is not.
+                                        // state; the IME inset is not. A focus
+                                        // loss is deliberately *not* an order
+                                        // to hide the IME: pages blur fields
+                                        // during re-renders and field-to-field
+                                        // moves, and the 1.1.6 re-check then
+                                        // closed the keyboard the viewer was
+                                        // typing on. Only BACK/MENU closes it.
                                         val focused = obj.optBoolean("__wafFocus")
-                                        post {
-                                            if (focused) {
-                                                focusGeneration.incrementAndGet()
-                                                if (!editing) {
+                                        if (focused) {
+                                            post {
+                                                // Only the transition into
+                                                // editing enters here. Starting
+                                                // again while `editing` would
+                                                // reinject the reporting bridge
+                                                // and report again in a loop,
+                                                // and BACK/MENU has already
+                                                // been honoured below.
+                                                if (!editing &&
+                                                    SystemClock.uptimeMillis() >
+                                                    imeSuppressedUntil.get()
+                                                ) {
                                                     beginEditing(self)
-                                                } else {
-                                                    pointerOverlay?.visibility = View.GONE
+                                                } else if (editing) {
+                                                    pointerOverlay?.visibility =
+                                                        View.GONE
                                                 }
-                                            } else {
-                                                scheduleEndEditingIfBlurred(self)
                                             }
                                         }
                                         return

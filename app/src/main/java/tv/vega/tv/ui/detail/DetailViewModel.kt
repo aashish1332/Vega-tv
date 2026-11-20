@@ -10,11 +10,13 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import tv.vega.tv.data.DisplayCapability
 import tv.vega.tv.data.ServiceLocator
 import tv.vega.tv.data.model.EpisodeItem
 import tv.vega.tv.data.model.VegaInfo
 import tv.vega.tv.data.providers.readableProviderError
 import tv.vega.tv.player.PlaybackSession
+import tv.vega.tv.player.is4kQuality
 import tv.vega.tv.player.qualityScore
 import tv.vega.tv.ui.common.UiState
 import tv.vega.tv.ui.common.episodeNumber
@@ -165,17 +167,31 @@ class DetailViewModel : ViewModel() {
                 // Play button, which takes the first card) starts on the best
                 // copy the provider offers.
                 val movie = tv.vega.tv.player.isMovieInfo(enriched)
-                val ordered = if (movie) {
-                    enriched.linkList.sortedByDescending { season ->
-                        qualityScore(
-                            season.quality?.trim().orEmpty()
-                                .ifBlank { season.title.trim() }
-                                .ifBlank { season.directLinks.firstOrNull()?.title.orEmpty() },
-                        )
+                val panel4k = DisplayCapability.supports4k()
+                // Shape 2: every linkList entry is one whole rendition. A 1080p
+                // panel must not list a 4K copy as a separate row, or the page
+                // offers a "choice" that looks the same as its 1080p sibling.
+                // A single-entry list is shape 1 (cards inside directLinks) and
+                // is filtered card-by-card in the resolve loop below.
+                val renditionLabel: (tv.vega.tv.data.model.SeasonEntry) -> String = { season ->
+                    season.quality?.trim().orEmpty()
+                        .ifBlank { season.title.trim() }
+                        .ifBlank { season.directLinks.firstOrNull()?.title.orEmpty() }
+                }
+                val shape2 = enriched.linkList.size > 1 &&
+                    enriched.linkList.all { it.directLinks.size <= 1 }
+                val sortedForPanel = if (movie) {
+                    val sorted = enriched.linkList.sortedByDescending { qualityScore(renditionLabel(it)) }
+                    if (panel4k || !shape2) {
+                        sorted
+                    } else {
+                        val visible = sorted.filterNot { is4kQuality(renditionLabel(it)) }
+                        visible.ifEmpty { sorted }
                     }
                 } else {
                     enriched.linkList
                 }
+                val ordered = sortedForPanel
                 val emptyTitle = if (movie) "Qualities" else "Episodes"
                 // Shape-2 movies name the rendition in `quality`, not `title`.
                 val headerOf: (tv.vega.tv.data.model.SeasonEntry) -> String = { season ->
@@ -273,8 +289,17 @@ class DetailViewModel : ViewModel() {
                         }
                         val eps = if (movie) {
                             // Quality cards: best-first, matching the player's
-                            // Quality list.
-                            raw.sortedByDescending { qualityScore(it.title) }
+                            // Quality list. On a 1080p panel the 4K/8K cards
+                            // are dropped; when the provider published only
+                            // those, the list stays intact so the title is
+                            // still playable.
+                            val sorted = raw.sortedByDescending { qualityScore(it.title) }
+                            if (panel4k) {
+                                sorted
+                            } else {
+                                val visible = sorted.filterNot { is4kQuality(it.title) }
+                                visible.ifEmpty { sorted }
+                            }
                         } else {
                             // Providers list newest-first often enough that the
                             // first card used to be the last episode. Titles
