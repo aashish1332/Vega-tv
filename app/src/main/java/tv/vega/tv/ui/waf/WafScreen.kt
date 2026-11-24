@@ -67,6 +67,7 @@ import org.json.JSONObject
 import org.json.JSONTokener
 import tv.vega.tv.data.providers.COMMON_USER_AGENT
 import tv.vega.tv.data.providers.WafCoordinator
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.roundToInt
@@ -696,6 +697,21 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
     // beginEditing (key repeat, repeated bridge focus reports) must not
     // trigger another show.
     val lastImeShowAt = remember { AtomicLong(0L) }
+    // TV keyboards are often their own window or activity: BACK finishes that
+    // window and the app never sees the key, so `editing` would stay true and
+    // the cursor would stay buried. These track the keyboard lifecycle so the
+    // cursor can be restored without ever hiding a keyboard that is still up.
+    val imeSeenWhileEditing = remember { AtomicBoolean(false) }
+    val windowLostWhileEditing = remember { AtomicBoolean(false) }
+    val editingSince = remember { AtomicLong(0L) }
+    // Called from the WebView's window-focus callback (main thread). Replaced
+    // on every composition so it always reads the current editing state.
+    val windowFocusAction = remember { AtomicReference<(Boolean) -> Unit>({}) }
+    // Called from the WebView's pre-IME key dispatch. On Fire TV the system
+    // keyboard is a modal window that consumes BACK before the activity sees
+    // it; the focused view still gets the key through onKeyPreIme first, which
+    // is how native EditTexts close that keyboard.
+    val keyPreImeBackAction = remember { AtomicReference<() -> Unit>({}) }
     val toolbarFocus = remember { FocusRequester() }
     val webViewFocus = remember { FocusRequester() }
     // Pointer keys arrive on the WebView's key listener (the page always keeps
@@ -767,6 +783,9 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
         // window kept at its own size this stays the full height, which is
         // what the page uses to choose its fallback band.
         if (started) {
+            editingSince.set(SystemClock.uptimeMillis())
+            imeSeenWhileEditing.set(false)
+            windowLostWhileEditing.set(false)
             runCatching {
                 wv.evaluateJavascript(
                     "window.__vegaBaseVh=Math.max(window.__vegaBaseVh||0,window.innerHeight||0);'saved'",
@@ -790,26 +809,34 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
     }
 
     /**
-     * Closes the keyboard and hands the page back. The cursor is restored only
-     * in pointer mode: page mode has no cursor, and returning the D-pad to the
-     * page's spatial navigation is the right "done typing" state there.
+     * The state half of closing the keyboard: leaves editing mode and puts the
+     * native cursor back. It never touches the IME, so it is also safe when the
+     * system closed the keyboard itself (a TV IME window consumes BACK). The
+     * cursor is restored only in pointer mode: page mode has no cursor, and
+     * returning the D-pad to page navigation is the right "done typing" state.
      */
-    fun endEditing() {
+    fun finishEditing() {
         editing = false
-        // The IME stays visible for a few frames after hideSoftInput. Suppress
-        // adoption long enough that a slow TV firmware cannot re-adopt it and
-        // reopen the keyboard under the viewer's hands after BACK.
+        // The IME stays visible for a few frames after it is told to hide.
+        // Suppress adoption long enough that slow TV firmware cannot re-adopt
+        // it and reopen the keyboard under the viewer's hands after BACK.
         imeSuppressedUntil.set(SystemClock.uptimeMillis() + 4_000)
-        val wv = webView ?: return
-        runCatching {
-            wv.evaluateJavascript("window.__vegaImePx=0;window.__vegaReveal&&window.__vegaReveal()", null)
+        imeSeenWhileEditing.set(false)
+        windowLostWhileEditing.set(false)
+        val wv = webView
+        if (wv != null) {
+            runCatching {
+                wv.evaluateJavascript(
+                    "window.__vegaImePx=0;window.__vegaReveal&&window.__vegaReveal()",
+                    null,
+                )
+            }
+            wv.requestFocus()
         }
-        val imm = wv.context.getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
-        imm?.hideSoftInputFromWindow(wv.windowToken, 0)
-        ViewCompat.getWindowInsetsController(wv)?.hide(WindowInsetsCompat.Type.ime())
-        wv.requestFocus()
         if (mode == NavMode.Pointer) {
-            if (wv.width > 0 && wv.height > 0 && (cursorX < 0f || cursorY < 0f)) {
+            if (wv != null && wv.width > 0 && wv.height > 0 &&
+                (cursorX < 0f || cursorY < 0f)
+            ) {
                 cursorX = wv.width / 2f
                 cursorY = wv.height / 2f
             }
@@ -821,6 +848,56 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
             status = "Keyboard closed — page mode"
         }
     }
+
+    /**
+     * Closes the keyboard ourselves (BACK/MENU) and hands the page back.
+     */
+    fun endEditing() {
+        val wv = webView
+        if (wv != null) {
+            val imm = wv.context.getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+            imm?.hideSoftInputFromWindow(wv.windowToken, 0)
+            ViewCompat.getWindowInsetsController(wv)?.hide(WindowInsetsCompat.Type.ime())
+        }
+        finishEditing()
+    }
+
+    // A full-screen TV keyboard is its own window: BACK finishes that window
+    // and the app only sees focus return, so `editing` never gets cleared. If
+    // focus comes back and the IME is verifiably gone, restore the cursor; if
+    // the IME is still visible, leave the viewer's keyboard alone.
+    windowFocusAction.set { hasFocus ->
+        if (!hasFocus) {
+            if (editing) windowLostWhileEditing.set(true)
+        } else if (editing && windowLostWhileEditing.getAndSet(false)) {
+            val wv = webView
+            if (wv != null) {
+                // The IME inset can trail the focus change by a frame or two.
+                // Poll briefly instead of checking once and giving up; every
+                // check still requires the IME to be verifiably gone.
+                var attempts = 0
+                val check = object : Runnable {
+                    override fun run() {
+                        if (!editing) return
+                        val current = webView ?: return
+                        if (!current.imeVisible()) {
+                            Log.i(IME_TAG, "IME window closed without BACK; restoring cursor")
+                            finishEditing()
+                        } else if (++attempts < 8) {
+                            current.postDelayed(this, 250)
+                        }
+                    }
+                }
+                wv.postDelayed(check, 250)
+            }
+        }
+    }
+
+    // Fire TV's keyboard is a modal overlay that can take BACK before the
+    // activity's dispatchKeyEvent runs. The focused WebView still receives the
+    // key through onKeyPreIme first (the same hook native EditTexts use), so
+    // close the keyboard and restore the cursor from there.
+    keyPreImeBackAction.set { endEditing() }
 
     fun requestKeyboardIfEditable(wv: WebView) {
         runCatching {
@@ -1222,19 +1299,39 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
 
     // The keyboard is not only opened by our tap probe: a page can focus a
     // field itself on load. This observer adopts an IME it can actually see.
-    // It never ends editing, because on TV firmware and under
-    // FLAG_LAYOUT_NO_LIMITS imeVisible() is often false while the IME is
-    // visibly up; the old "seen then unseen" path then called endEditing() and
-    // really hid the keyboard the viewer was typing on. Only BACK/MENU closes
-    // the keyboard; the page's own activity is tracked by DOM focus.
+    // It also notices when a keyboard closes without our BACK path (the IME
+    // window consumed the key): on API 30+ the IME inset is authoritative, so
+    // three consecutive "hidden" polls after a keyboard that was seen up mean
+    // the viewer is done typing. The state-only restore below never hides an
+    // IME, and older firmware (where the frame fallback can report "hidden"
+    // while the keyboard is up) is left to the window-focus path.
     LaunchedEffect(webView) {
         val wv = webView ?: return@LaunchedEffect
+        var hiddenPolls = 0
         while (true) {
             delay(300)
-            if (!editing && wv.imeVisible() &&
-                SystemClock.uptimeMillis() > imeSuppressedUntil.get()
+            val imeVisible = wv.imeVisible()
+            if (!editing) {
+                hiddenPolls = 0
+                if (imeVisible && SystemClock.uptimeMillis() > imeSuppressedUntil.get()) {
+                    beginEditing(wv)
+                }
+                continue
+            }
+            if (imeVisible) {
+                imeSeenWhileEditing.set(true)
+                hiddenPolls = 0
+                continue
+            }
+            if (Build.VERSION.SDK_INT >= 30 &&
+                imeSeenWhileEditing.get() &&
+                SystemClock.uptimeMillis() - editingSince.get() > 1_500L
             ) {
-                beginEditing(wv)
+                if (++hiddenPolls >= 3) {
+                    Log.i(IME_TAG, "IME vanished while editing; restoring cursor")
+                    finishEditing()
+                    hiddenPolls = 0
+                }
             }
         }
     }
@@ -1400,7 +1497,47 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
                         // overlay View cannot be hidden by page layers,
                         // cross-origin iframes, or a site that rewrites its DOM.
                         val frame = FrameLayout(c)
-                        WebView(c).apply {
+                        // A TV keyboard can be a separate window. Its open and
+                        // close are visible here as window-focus changes, even
+                        // when the activity never receives the BACK key.
+                        object : WebView(c) {
+                            // A BACK that closes the keyboard must also swallow
+                            // its matching UP, otherwise the activity sees a
+                            // stray key-up after editing has already ended.
+                            private var swallowBackUp = false
+
+                            override fun onWindowFocusChanged(hasWindowFocus: Boolean) {
+                                super.onWindowFocusChanged(hasWindowFocus)
+                                windowFocusAction.get().invoke(hasWindowFocus)
+                            }
+
+                            override fun onKeyPreIme(
+                                keyCode: Int,
+                                event: AndroidKeyEvent,
+                            ): Boolean {
+                                if (keyCode == AndroidKeyEvent.KEYCODE_BACK) {
+                                    if (event.action == AndroidKeyEvent.ACTION_DOWN) {
+                                        // Fire TV's keyboard takes BACK before
+                                        // the activity sees it. Pre-IME
+                                        // dispatch reaches this view first, so
+                                        // close the keyboard here and restore
+                                        // the cursor instead of letting the
+                                        // IME consume the key.
+                                        if (editing || imeVisible()) {
+                                            swallowBackUp = true
+                                            keyPreImeBackAction.get().invoke()
+                                            return true
+                                        }
+                                    } else if (event.action == AndroidKeyEvent.ACTION_UP &&
+                                        swallowBackUp
+                                    ) {
+                                        swallowBackUp = false
+                                        return true
+                                    }
+                                }
+                                return super.onKeyPreIme(keyCode, event)
+                            }
+                        }.apply {
                             layoutParams = ViewGroup.LayoutParams(
                                 ViewGroup.LayoutParams.MATCH_PARENT,
                                 ViewGroup.LayoutParams.MATCH_PARENT,

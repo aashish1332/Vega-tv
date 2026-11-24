@@ -35,10 +35,14 @@ class VegaLoadControl(
     private val byteBudget: Long,
 ) : DefaultLoadControl(
     allocator,
-    /* bufferForPlaybackMs = */ 1_500,
-    /* bufferForPlaybackAfterRebufferMs = */ 3_000,
+    // Java parameter order, not builder order: min and max come first. Passing
+    // the builder order (playback first) trips the constructor's
+    // `minBufferMs >= bufferForPlaybackMs` assertion and kills the process the
+    // moment the player is built.
     /* minBufferMs = */ 8_000,
     /* maxBufferMs = */ 600_000,
+    /* bufferForPlaybackMs = */ 1_500,
+    /* bufferForPlaybackAfterRebufferMs = */ 3_000,
     /* targetBufferBytes = */ C.LENGTH_UNSET,
     /* prioritizeTimeOverSizeThresholds = */ true,
     /* backBufferDurationMs = */ 0,
