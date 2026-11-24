@@ -141,6 +141,9 @@ Verified build:
   `playableQualityLinks` are absent, which confirms the 4K revert.
 - SHA-256
   `3CF802B341AF8CEBFCB6B8CC96591356FC4043B3A64F7A8C448EF6C0417705C9`.
+- Released as https://github.com/aashish1332/Vega-tv/releases/tag/v1.1.8
+  (asset `app-debug.apk`). The uploaded asset reports the same size
+  (23,658,875 bytes) and SHA-256.
 
 ## Device test for 1.1.8
 
