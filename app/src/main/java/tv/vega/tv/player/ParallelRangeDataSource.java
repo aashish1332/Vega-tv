@@ -33,14 +33,20 @@ import java.util.concurrent.atomic.AtomicInteger;
  * and stalls. This source therefore starts every open as one normal request,
  * measures how fast that request actually delivers bytes, and switches to
  * ordered chunks on up to four sockets only when the measured rate is below
- * what the file needs.
+ * the fixed "too slow for video" floor.
  *
- * <p>The decision is deliberately conservative. A fast start is not treated as
- * proof: the measurement runs in three-second / 512-KB windows for as long as
- * the open stays on one connection, so a connection that starts fast and is
- * then shaped still triggers a switch. A switch always happens at the exact
- * byte the player has reached, so nothing is downloaded twice and no data is
- * lost.
+ * <p>That floor is deliberately low (1.5 MB/s, the same value the official
+ * client uses). A player only reads as fast as it consumes once its forward
+ * buffer is full, so a healthy 90 Mbps film measures roughly 11 MB/s — its own
+ * bitrate, not the link's capacity. A higher threshold therefore switches
+ * almost every 4K film onto parallel ranges for no reason. Below 1.5 MB/s no
+ * video bitrate can be sustained at all, so a switch there is unambiguous.
+ *
+ * <p>The decision is still conservative. A fast start is not treated as proof:
+ * the measurement runs in three-second / 512-KB windows for as long as the
+ * open stays on one connection, so a connection that starts fast and is then
+ * shaped still triggers a switch. A switch always happens at the exact byte
+ * the player has reached, so nothing is downloaded twice and no data is lost.
  *
  * <p>Once chunks are running, the source measures their aggregate delivery
  * rate. If parallel requests do not beat the single request by a real margin,
@@ -57,9 +63,9 @@ import java.util.concurrent.atomic.AtomicInteger;
  *
  * <p>Any open that still has at least {@link #MIN_PARALLEL_BYTES} left to
  * stream is measured and may switch, not just multi-gigabyte files: a 300 MB
- * episode on a throttled host stalls the same way an 80 GB remux does. The
- * measured rate is compared with what the file needs, and a connection that
- * is fast enough stays single. Small HLS segments, subtitles, playlists and
+ * episode on a throttled host stalls the same way an 80 GB remux does. A
+ * connection that delivers at least {@link #SLOW_BYTES_PER_SECOND} stays
+ * single. Small HLS segments, subtitles, playlists and
  * the bounded 64 KB Matroska probes stay single-request. A URL that already
  * benefited engages at once on later seeks. A 429 or 503 permanently lowers
  * the connection count for that host. A server that ignores a range is marked
@@ -75,13 +81,15 @@ public final class ParallelRangeDataSource implements DataSource {
     private static final long MEASURE_MIN_NANOS = 3_000_000_000L;
     private static final long MEASURE_MIN_BYTES = 512L * 1024L;
     /**
-     * Never switch when one connection already delivers this much: 16 MB/s is
-     * 128 Mbps, comfortably above a 4K remux's ~90 Mbps average. A connection
-     * below this cannot keep a 4K film buffered through normal jitter.
+     * Below this, one connection cannot sustain any video bitrate. The official
+     * client uses the same floor and for the same reason: once the player's
+     * forward buffer is full it only reads at playback speed, so the measured
+     * rate of a healthy 90 Mbps film is ~11 MB/s — its bitrate, not the link.
+     * A threshold derived from the bitrate or the file size would therefore
+     * engage parallel ranges on nearly every large film. Only a genuinely
+     * starved connection (under ~12 Mbps) trips this.
      */
-    private static final long MIN_SWITCH_BYTES_PER_SECOND = 16L * 1000L * 1000L;
-    /** Feature-length bound used to estimate a file's bitrate from its size. */
-    private static final long ASSUMED_FILM_SECONDS = 90L * 60L;
+    private static final long SLOW_BYTES_PER_SECOND = 1_500_000L;
 
     private static final int FIRST_CHUNK_BYTES = 1024 * 1024;
     private static final int MAX_CHUNK_BYTES = 8 * 1024 * 1024;
@@ -496,7 +504,7 @@ public final class ParallelRangeDataSource implements DataSource {
                 long remaining = endPosition == C.LENGTH_UNSET
                         ? C.LENGTH_UNSET
                         : endPosition - position;
-                if (rate < switchThresholdBytesPerSecond()
+                if (rate < SLOW_BYTES_PER_SECOND
                         && remaining >= MIN_PARALLEL_BYTES) {
                     measuring = false;
                     switchToParallel(rate);
@@ -510,16 +518,6 @@ public final class ParallelRangeDataSource implements DataSource {
             }
         }
         return read;
-    }
-
-    /**
-     * The rate below which one connection cannot keep the film fed. A 90-minute
-     * bound converts the file size into a rough bitrate; the floor then covers
-     * files whose real duration is longer than that bound.
-     */
-    private long switchThresholdBytesPerSecond() {
-        long bySize = totalLength > 0 ? totalLength / ASSUMED_FILM_SECONDS : 0L;
-        return Math.max(MIN_SWITCH_BYTES_PER_SECOND, bySize);
     }
 
     /** Leaves the single request at the current byte and starts ordered chunks. */

@@ -84,7 +84,6 @@ import androidx.media3.common.TrackSelectionOverride
 import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.exoplayer.DecoderReuseEvaluation
-import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.analytics.AnalyticsListener
@@ -108,7 +107,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.isActive
-import tv.vega.tv.data.DisplayCapability
 import tv.vega.tv.data.ServiceLocator
 import tv.vega.tv.data.diag.DiagLog
 import tv.vega.tv.data.history.WatchEntry
@@ -117,14 +115,13 @@ import tv.vega.tv.data.model.VegaStream
 import tv.vega.tv.data.model.identityKey
 import tv.vega.tv.player.MatroskaCueDataSource
 import tv.vega.tv.player.ParallelRangeDataSource
+import tv.vega.tv.player.VegaLoadControl
 import tv.vega.tv.player.PlaybackSession
 import tv.vega.tv.player.PlayerKeyBus
 import tv.vega.tv.player.createDrmSessionManager
 import tv.vega.tv.player.drmUnsupportedReason
 import tv.vega.tv.player.playbackErrorMessage
-import tv.vega.tv.player.is4kQuality
 import tv.vega.tv.player.isMovieInfo
-import tv.vega.tv.player.playableQualityLinks
 import tv.vega.tv.player.qualityScore
 import tv.vega.tv.ui.common.UiState
 import tv.vega.tv.ui.common.VegaSpinner
@@ -173,12 +170,16 @@ private class SeekCoalescer {
  *
  * A fixed cap cannot serve both a 2 GB TV stick and a 4K box. The old fixed
  * 64 MB was only ~6 s at 80 Mbps, and a 5 s back buffer took most of it (see
- * the load control below), so a large 4K HDR file had almost no forward
- * cushion and rebuffered continuously. The official client instead sizes the
- * buffers from the device: at most 35% of the app heap and 1/32 of total RAM.
- * Keep the old 64 MB as the floor so no device gets a smaller buffer than
- * 1.1.3, and cap the result at 256 MB — enough for ~20 s of a 100 Mbps remux
- * while still a fraction of the heap on the boxes that can afford it.
+ * [VegaLoadControl]), so a large 4K HDR file had almost no forward cushion and
+ * rebuffered continuously. The official client instead sizes the buffers from
+ * the device: at most 35% of the app heap and 1/32 of total RAM. Keep the old
+ * 64 MB as the floor so no device gets a smaller buffer than 1.1.3, and cap the
+ * result at 256 MB — enough for ~20 s of a 100 Mbps remux while still a
+ * fraction of the heap on the boxes that can afford it.
+ *
+ * [VegaLoadControl] treats this as the read-ahead cap: it never stops loading
+ * below five seconds of media, so a bitrate that fills the cap faster than the
+ * stock minimum does not starve playback.
  */
 private fun mediaBufferBudgetBytes(ctx: Context): Int {
     val heap = Runtime.getRuntime().maxMemory()
@@ -227,13 +228,6 @@ fun PlayerScreen(
     val displayHeight = displayMetrics.heightPixels.coerceAtLeast(1)
     // Auto-quality reads this before the (slower) provider resolve completes.
     LaunchedEffect(displayHeight) { vm.maxPlaybackHeight = displayHeight }
-    // The panel, not the UI. Fire OS renders at 1080p on a 4K television, so
-    // displayMetrics understate what the screen can show and cannot be used to
-    // decide whether 4K renditions are real choices.
-    val supports4kPanel = remember { DisplayCapability.supports4k(ctx) }
-    val panelLongEdge = remember(supports4kPanel) {
-        DisplayCapability.maxLongEdge(ctx).let { if (it >= 3400) it else 3840 }
-    }
     val state by vm.state.collectAsStateWithLifecycle()
     val wafUrl by vm.wafUrl.collectAsStateWithLifecycle()
     val nextError by vm.nextError.collectAsStateWithLifecycle()
@@ -255,30 +249,6 @@ fun PlayerScreen(
     }
     val sel = streams.getOrNull(vm.selectedIndex) ?: streams.firstOrNull()
     val hasMedia = sel != null
-    // Some providers publish only 4K copies. The Quality tab must still offer
-    // one (otherwise the title cannot be played), so the video-track cap has to
-    // allow that track even on a 1080p panel.
-    val only4kRenditions = remember(streams, sel) {
-        val alternates = PlaybackSession.qualityAlternates
-        val allOffered4k = when {
-            alternates.isNotEmpty() -> alternates.all { is4kQuality(it.label) }
-            streams.isNotEmpty() -> streams.all {
-                streamHeight(it) >= 2000 || is4kQuality(it.quality.orEmpty())
-            }
-            else -> false
-        }
-        // A 4K rendition already playing (a resume saved before the panel
-        // filter existed) must not lose its video track to the 1080p cap.
-        allOffered4k || (sel != null && streamHeight(sel) >= 2000)
-    }
-    val videoWidthCap =
-        if (supports4kPanel || only4kRenditions) maxOf(displayWidth, panelLongEdge) else displayWidth
-    val videoHeightCap =
-        if (supports4kPanel || only4kRenditions) {
-            maxOf(displayHeight, panelLongEdge * 9 / 16)
-        } else {
-            displayHeight
-        }
     // Hindi is the requested default. "auto" clears the preference and lets
     // the source pick; a manual MENU ▸ Audio choice still wins for this stream.
     val audioLanguage by ServiceLocator.settings.audioLanguage
@@ -391,18 +361,14 @@ fun PlayerScreen(
                 // HLS masters offer every ladder rung, not just the link the
                 // provider named. Cap adaptive video at the panel's own size;
                 // otherwise ExoPlayer happily pulls a 4K variant on a 1080p TV
-                // and spends the whole film dropping frames. The cap is the
-                // supported panel mode, not the UI metrics: a 4K television
-                // whose launcher runs at 1080p must still accept a 4K track the
-                // viewer picked deliberately.
-                .setMaxVideoSize(videoWidthCap, videoHeightCap)
+                // and spends the whole film dropping frames.
+                .setMaxVideoSize(displayWidth, displayHeight)
                 .setPreferredAudioLanguages(*preferredAudioCodes(audioLanguage))
                 .build()
         }
     }
-    LaunchedEffect(audioLanguage, videoWidthCap, videoHeightCap) {
+    LaunchedEffect(audioLanguage) {
         trackSelector.parameters = trackSelector.buildUponParameters()
-            .setMaxVideoSize(videoWidthCap, videoHeightCap)
             .setPreferredAudioLanguages(*preferredAudioCodes(audioLanguage))
             .build()
     }
@@ -499,36 +465,17 @@ fun PlayerScreen(
             )
             .setTrackSelector(trackSelector)
             .setLoadControl(
-                DefaultLoadControl.Builder()
+                // Official-client parity: 8 s minimum, a very long maximum,
+                // start at 1.5 s, resume after a rebuffer at 3 s. The byte
+                // budget is applied by VegaLoadControl as a read-ahead cap
+                // that never stops the loader below 5 s of media, unlike the
+                // stock DefaultLoadControl's hard ceiling.
+                VegaLoadControl(
                     // 256 KB chunks: at 4K bitrates the 64 KB default churned
                     // thousands of small allocations per minute.
-                    .setAllocator(DefaultAllocator(true, 256 * 1024))
-                    // Heap/RAM-sized forward budget instead of a fixed 64 MB.
-                    // On a 2 GB TV this still resolves to ~64 MB; on a box
-                    // with a larger heap it buys the extra seconds a 4K HDR
-                    // remux needs. Never smaller than 1.1.3.
-                    .setTargetBufferBytes(mediaBufferBudgetBytes(ctx))
-                    // Matches the official client: 8s minimum, a very long
-                    // maximum, start at 1.5s, resume after a rebuffer at 3s.
-                    // The 600s ceiling is deliberate: the byte budget is the
-                    // real read-ahead limit (prioritiseTimeOverSizeThresholds
-                    // stays false), and a short 60s ceiling could stop loading
-                    // on a low-bitrate file before that budget was used. The
-                    // old 5s resume threshold was harsher than the official
-                    // 3s and, at 100 Mbps, required 62 MB — the whole 64 MB
-                    // budget — just to show a frame again.
-                    .setBufferDurationsMs(8_000, 600_000, 1_500, 3_000)
-                    // No back buffer. ExoPlayer keeps it in the same allocator
-                    // as the forward buffer, and its cost is pure bitrate:
-                    // 5s is 37 MB at 60 Mbps and 62 MB at 100 Mbps. That ate
-                    // the 64 MB budget, leaving 1–3s of forward media; the
-                    // player drained it, rebuffered, and ExoPlayer then threw
-                    // the back buffer away to unblock loading. A rewind now
-                    // re-fetches a range from the server instead of starving
-                    // a 4K HDR stream. This matches the official client's
-                    // default of no back buffer.
-                    .setBackBuffer(0, false)
-                    .build(),
+                    DefaultAllocator(true, 256 * 1024),
+                    mediaBufferBudgetBytes(ctx).toLong(),
+                ),
             )
             .build()
             .also { p ->
@@ -1635,12 +1582,8 @@ private fun PlayerChrome(
         ?: PlaybackSession.pendingLink
     // Distinct qualities the provider offered, best first, each mapped to its
     // best stream: the quality dropdown is the server list minus server names.
-    // Movie quality cards are whole alternate links instead. The playing link
-    // is passed so a 4K rendition already on screen is not hidden by the
-    // panel's 4K filter.
-    val choices = remember(streams, selectedIndex, currentEpLink) {
-        qualityChoices(streams, selectedIndex, currentEpLink)
-    }
+    // Movie quality cards are whole alternate links and are appended.
+    val choices = remember(streams) { qualityChoices(streams) }
     val currentQuality = PlaybackSession.qualityAlternates
         .firstOrNull { it.link == currentEpLink }?.label
         ?: (streams.getOrNull(selectedIndex)?.quality ?: "").trim().ifBlank { "Auto" }
@@ -3094,31 +3037,15 @@ private data class QualityChoice(
  * and pretend the other cards do not exist. Best resolution, then largest file,
  * comes first. Shows have no alternates and keep their stream qualities.
  */
-private fun qualityChoices(
-    streams: List<VegaStream>,
-    selectedIndex: Int,
-    playingLink: String,
-): List<QualityChoice> {
+private fun qualityChoices(streams: List<VegaStream>): List<QualityChoice> {
     val alternates = PlaybackSession.qualityAlternates
     if (alternates.isNotEmpty()) {
-        return playableQualityLinks(alternates.distinctBy { it.link }, playingLink)
+        return alternates
+            .distinctBy { it.link }
             .sortedByDescending { qualityScore(it.label) }
             .map { QualityChoice(it.label, link = it.link) }
     }
-    val options = qualityOptions(streams)
-    // A 1080p panel gets only renditions it can actually show. The selected
-    // entry is kept: it is what is playing, and removing it would leave the
-    // tick nowhere. When every rendition is 4K the list is returned unchanged,
-    // because the provider published nothing else to play.
-    val visible = if (DisplayCapability.supports4k()) {
-        options
-    } else {
-        options.filter { (label, i) ->
-            i == selectedIndex ||
-                !(is4kQuality(label) || streamHeight(streams[i]) >= 2000)
-        }.ifEmpty { options }
-    }
-    return visible.map { (label, i) ->
+    return qualityOptions(streams).map { (label, i) ->
         QualityChoice(label, streamIndex = i)
     }
 }

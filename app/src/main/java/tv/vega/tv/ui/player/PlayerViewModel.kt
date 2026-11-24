@@ -418,13 +418,10 @@ class PlayerViewModel : ViewModel() {
                 throw original
             }
             if (tv.vega.tv.player.isMovieInfo(info)) {
-                val alternates = tv.vega.tv.player.qualityLinksOf(info)
-                // Same panel rule as the Quality tab: never resolve a 4K link
-                // on a 1080p television while a playable rendition exists.
-                val direct = tv.vega.tv.player.playableQualityLinks(alternates)
+                val direct = tv.vega.tv.player.qualityLinksOf(info)
                     .firstOrNull()?.link?.takeIf { it.isNotBlank() } ?: throw original
                 PlaybackSession.info = info
-                PlaybackSession.qualityAlternates = alternates
+                PlaybackSession.qualityAlternates = tv.vega.tv.player.qualityLinksOf(info)
                 PlaybackSession.pendingLink = direct
                 PlaybackSession.pendingFallbackLink = ""
                 PlaybackSession.pendingType = info.type.ifBlank { PlaybackSession.pendingType }

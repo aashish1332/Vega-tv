@@ -125,7 +125,11 @@ locally and marked [B] only after the user's device test.
   only re-checks the band, so the page does not jump on every key. If the page
   cannot scroll, the active field is handed to `scrollIntoView`.
 
-## 7. 4K renditions
+## 7. 4K renditions — REVERTED in 1.1.8
+
+> This section describes 1.1.7 only. The restriction is removed in 1.1.8: every
+> provider quality is offered again, the panel-size video cap is restored and
+> `DisplayCapability.kt` is deleted. See `BUGFIX-1.1.8.md` §4.
 
 - `DisplayCapability` reads the panel's supported display modes, not
   `displayMetrics` (Fire OS renders its UI at 1080p on a 4K television). A
