@@ -242,7 +242,17 @@ class DetailViewModel : ViewModel() {
                                     season.quality?.trim().orEmpty()
                                         .ifBlank { season.title.trim() }
                                 }
-                                EpisodeItem(title = title, link = d.link, image = d.image)
+                                EpisodeItem(
+                                    title = title,
+                                    link = d.link,
+                                    image = d.image,
+                                    // A movie's intro/outro can arrive on the
+                                    // rendition card itself; dropping it here
+                                    // is what left direct-link playback with no
+                                    // skip button.
+                                    skip = d.skip,
+                                    skips = d.skips,
+                                )
                             }
                         } else {
                             val listed = season.episodesLink
@@ -267,7 +277,13 @@ class DetailViewModel : ViewModel() {
                                 season.directLinks.mapNotNull { d ->
                                     val title = d.title.trim()
                                     if (title.isEmpty() || d.link.isBlank()) null
-                                    else EpisodeItem(title = title, link = d.link, image = d.image)
+                                    else EpisodeItem(
+                                        title = title,
+                                        link = d.link,
+                                        image = d.image,
+                                        skip = d.skip,
+                                        skips = d.skips,
+                                    )
                                 }
                             }
                         }

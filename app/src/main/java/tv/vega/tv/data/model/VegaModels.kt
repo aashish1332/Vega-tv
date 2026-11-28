@@ -114,7 +114,15 @@ data class VegaStream(
     val subtitles: List<SubtitleTrack> = emptyList(),
     val headers: Map<String, String> = emptyMap(),
     val drm: StreamDrm? = null,
-    val skip: List<SkipInterval> = emptyList(),
+    /**
+     * Intro/outro markers. Nullable because provider JSON uses both `skip`
+     * and `skips`, and either may be explicitly null. The official client
+     * treats a null list as "no markers"; a non-null type would make the
+     * whole stream list unparseable instead.
+     */
+    val skip: List<SkipInterval>? = null,
+    /** Unofficial alias for [skip]; the player merges both. */
+    val skips: List<SkipInterval>? = null,
 )
 
 /**
@@ -143,7 +151,10 @@ data class DirectLink(
     val description: String? = null,
     val image: String? = null,
     val quickDownload: Boolean? = null,
-    val skip: List<SkipInterval> = emptyList(),
+    /** Intro/outro markers; null means none. See [VegaStream.skip]. */
+    val skip: List<SkipInterval>? = null,
+    /** Unofficial alias for [skip]; the player merges both. */
+    val skips: List<SkipInterval>? = null,
 )
 
 @Serializable
@@ -164,7 +175,10 @@ data class EpisodeItem(
     val description: String? = null,
     val image: String? = null,
     val quickDownload: Boolean? = null,
-    val skip: List<SkipInterval> = emptyList(),
+    /** Intro/outro markers; null means none. See [VegaStream.skip]. */
+    val skip: List<SkipInterval>? = null,
+    /** Unofficial alias for [skip]; the player merges both. */
+    val skips: List<SkipInterval>? = null,
     // Local presentation helper, not from JSON.
     val number: Int = 0,
 )

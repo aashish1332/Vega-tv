@@ -107,12 +107,15 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.isActive
+import kotlin.math.abs
 import tv.vega.tv.data.ServiceLocator
 import tv.vega.tv.data.diag.DiagLog
 import tv.vega.tv.data.history.WatchEntry
 import tv.vega.tv.data.net.NetClients
 import tv.vega.tv.data.model.VegaStream
+import tv.vega.tv.data.model.SkipInterval
 import tv.vega.tv.data.model.identityKey
+import tv.vega.tv.player.BufferSignals
 import tv.vega.tv.player.MatroskaCueDataSource
 import tv.vega.tv.player.ParallelRangeDataSource
 import tv.vega.tv.player.VegaLoadControl
@@ -177,9 +180,11 @@ private class SeekCoalescer {
  * result at 256 MB — enough for ~20 s of a 100 Mbps remux while still a
  * fraction of the heap on the boxes that can afford it.
  *
- * [VegaLoadControl] treats this as the read-ahead cap: it never stops loading
- * below five seconds of media, so a bitrate that fills the cap faster than the
- * stock minimum does not starve playback.
+ * [VegaLoadControl] applies this value as the forward read-ahead cap, exactly
+ * like the official client: once the allocator holds the budget and more than
+ * five seconds are buffered, loading stops until playback frees the blocks.
+ * The five-second floor keeps a high-bitrate film from stopping with an empty
+ * buffer, and the cap still bounds memory.
  */
 private fun mediaBufferBudgetBytes(ctx: Context): Int {
     val heap = Runtime.getRuntime().maxMemory()
@@ -421,7 +426,15 @@ fun PlayerScreen(
     // sits *below* the Matroska wrapper so the cue/header probes above stay
     // single-request; small HLS segments, sidecars and small files pass
     // untouched.
-    val parallelHttp = remember { ParallelRangeDataSource.Factory(headerHttp, rangeChunkHttp) }
+    //
+    // The load control publishes the film's own bitrate and every real network
+    // stall through this holder, so the source can tell a genuinely starved
+    // connection from a healthy one even when the provider declares no
+    // bitrate.
+    val bufferSignals = remember { BufferSignals() }
+    val parallelHttp = remember {
+        ParallelRangeDataSource.Factory(headerHttp, rangeChunkHttp, bufferSignals)
+    }
     // Matroska files whose Cues are reachable only through a chained SeekHead
     // make Media3 report the stream as unseekable, and every seek then restarts
     // playback at 0:00. This wrapper rewrites that one SeekEntry in flight;
@@ -467,14 +480,15 @@ fun PlayerScreen(
             .setLoadControl(
                 // Official-client parity: 8 s minimum, a very long maximum,
                 // start at 1.5 s, resume after a rebuffer at 3 s. The byte
-                // budget is applied by VegaLoadControl as a read-ahead cap
-                // that never stops the loader below 5 s of media, unlike the
-                // stock DefaultLoadControl's hard ceiling.
+                // budget is applied by VegaLoadControl with the same 5 s
+                // forward-full rule as the official client, so a high-bitrate
+                // film never stops with an empty buffer.
                 VegaLoadControl(
                     // 256 KB chunks: at 4K bitrates the 64 KB default churned
                     // thousands of small allocations per minute.
                     DefaultAllocator(true, 256 * 1024),
                     mediaBufferBudgetBytes(ctx).toLong(),
+                    bufferSignals,
                 ),
             )
             .build()
@@ -1911,8 +1925,10 @@ private fun PlayerChrome(
 
 /**
  * "Skip intro" chip. Unlike the rest of the chrome it stays on screen while
- * the controls are hidden, so it polls its own position once a second instead
- * of riding the chrome clock — recomposition is confined to this chip.
+ * the controls are hidden, so it polls its own position instead of riding the
+ * chrome clock. The poll is fast enough that the chip appears the moment an
+ * interval starts, but state changes only when the active interval changes, so
+ * a four-times-a-second clock does not recompose anything.
  */
 @Composable
 private fun SkipChip(
@@ -1922,18 +1938,39 @@ private fun SkipChip(
     onTouch: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    var posMs by remember { mutableLongStateOf(0L) }
-    LaunchedEffect(Unit) {
+    var active by remember(skips) { mutableStateOf<Skip?>(null) }
+    LaunchedEffect(skips) {
         while (true) {
-            posMs = player.currentPosition.coerceAtLeast(0L)
-            delay(1000)
+            val posMs = player.currentPosition.coerceAtLeast(0L)
+            val next = skips.firstOrNull { posMs >= it.fromMs && posMs < it.toMs }
+            if (next != active) active = next
+            delay(250)
         }
     }
-    val active = skips.firstOrNull { posMs >= it.fromMs && posMs < it.toMs } ?: return
+    val skip = active ?: return
     Button(
-        onClick = { player.seekTo(active.toMs); onTouch() },
+        onClick = {
+            player.seekTo(skip.toMs)
+            // Hide on the press itself; waiting for the next position tick
+            // leaves a button that has already done its job on screen.
+            active = null
+            onTouch()
+        },
         modifier = modifier.padding(end = 28.dp, bottom = if (showUI) 150.dp else 28.dp),
-    ) { Text("Skip ${active.title.ifBlank { "Intro" }}".trim()) }
+    ) { Text(skipLabel(skip.title)) }
+}
+
+/**
+ * Official label rule: a provider that already sends "Skip Intro" must not
+ * become "Skip Skip Intro", while a bare "Outro" becomes "Skip Outro".
+ */
+private fun skipLabel(title: String): String {
+    val text = title.trim()
+    return when {
+        text.isEmpty() -> "Skip Intro"
+        text.startsWith("skip", ignoreCase = true) -> text
+        else -> "Skip $text"
+    }
 }
 
 /** Top row: exit, what is playing, and which server is carrying it. */
@@ -2229,20 +2266,27 @@ private fun PlayerScrubber(
                     .clip(RoundedCornerShape(2.dp))
                     .background(VegaPrimary),
             )
-            skips.forEach { skip ->
-                val f = if (hasDuration) {
-                    (skip.fromMs.toFloat() / durationMs).coerceIn(0f, 1f)
-                } else 0f
-                Box(
-                    Modifier.fillMaxWidth(f.coerceAtLeast(MIN_TRACK)).fillMaxHeight()
-                        .wrapContentWidth(Alignment.End)
-                        .wrapContentHeight(Alignment.CenterVertically),
-                ) {
-                    Box(
-                        Modifier.width(3.dp).height(10.dp)
-                            .clip(RoundedCornerShape(2.dp))
-                            .background(Color(0xFFFFC46B)),
-                    )
+            // Official skip rendering: two black boundary marks per interval,
+            // at the start and the end, so the skipped section reads as a gap
+            // in the track. A boundary at 0 or at the duration lies outside the
+            // track and is skipped, exactly as in the mobile client.
+            if (hasDuration) {
+                skips.forEach { skip ->
+                    listOf(skip.fromMs, skip.toMs).forEach { at ->
+                        if (at > 0 && at < durationMs) {
+                            val f = (at.toFloat() / durationMs).coerceIn(0f, 1f)
+                            Box(
+                                Modifier.fillMaxWidth(f.coerceAtLeast(MIN_TRACK)).fillMaxHeight()
+                                    .wrapContentWidth(Alignment.End)
+                                    .wrapContentHeight(Alignment.CenterVertically),
+                            ) {
+                                Box(
+                                    Modifier.width(3.dp).height(4.dp)
+                                        .background(Color.Black),
+                                )
+                            }
+                        }
+                    }
                 }
             }
             Box(
@@ -3076,17 +3120,64 @@ private fun episodeSubtitle(ep: tv.vega.tv.data.model.EpisodeItem): String {
     return if (num.isNotBlank()) "Episode $num · $label" else label
 }
 
+/**
+ * Every skip interval the current episode can carry, merged the way the
+ * official client merges them: the episode, the selected stream, and a direct
+ * link card that names the playing link. Providers use `skip` and `skips`
+ * interchangeably, so both are read.
+ *
+ * Malformed intervals are rejected rather than trusted: a negative start or an
+ * empty range would draw a marker in the wrong place and seek backwards.
+ */
 private fun collectSkips(sel: VegaStream): List<Skip> {
     val out = mutableListOf<Skip>()
-    fun add(list: List<tv.vega.tv.data.model.SkipInterval>) {
-        list.forEach {
-            out.add(Skip(it.title.orEmpty(), (it.from * 1000).toLong(), (it.to * 1000).toLong()))
+    fun add(list: List<SkipInterval>?) {
+        if (list == null) return
+        for (item in list) {
+            if (item.from < 0.0 || item.to <= item.from) continue
+            val fromMs = (item.from * 1000).toLong()
+            val toMs = (item.to * 1000).toLong()
+            if (fromMs < 0 || toMs <= fromMs) continue
+            // The official client treats intervals within a second of each
+            // other as the same one; providers repeat them across sources with
+            // slightly different rounding.
+            val exists = out.any { skip ->
+                abs(skip.fromMs - fromMs) < 1_000 && abs(skip.toMs - toMs) < 1_000
+            }
+            if (!exists) {
+                out.add(
+                    Skip(
+                        title = item.title?.trim().orEmpty().ifBlank { "Intro" },
+                        fromMs = fromMs,
+                        toMs = toMs,
+                    ),
+                )
+            }
         }
     }
+
+    val episode = PlaybackSession.episodes.getOrNull(PlaybackSession.startIndex)
     add(sel.skip)
-    val ep = PlaybackSession.episodes.getOrNull(PlaybackSession.startIndex)
-    ep?.skip?.let { add(it) }
-    return out.distinctBy { it.fromMs to it.toMs }.sortedBy { it.fromMs }
+    add(sel.skips)
+    episode?.let {
+        add(it.skip)
+        add(it.skips)
+    }
+
+    // Direct links are playable episodes too, but providers attach their
+    // intervals to the linkList card instead of the episode row. Match it by
+    // URL, as the official client does.
+    val episodeLink = episode?.link
+    if (!episodeLink.isNullOrBlank()) {
+        PlaybackSession.info?.linkList?.forEach { season ->
+            season.directLinks.firstOrNull { it.link == episodeLink }?.let {
+                add(it.skip)
+                add(it.skips)
+            }
+        }
+    }
+
+    return out.sortedBy { it.fromMs }
 }
 
 private fun mimeOf(uri: String, declared: String): String {

@@ -1,8 +1,6 @@
 ﻿package tv.vega.tv.ui.waf
 
-import android.app.Activity
 import android.content.Context
-import android.content.ContextWrapper
 import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.Rect
@@ -14,7 +12,6 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.ViewTreeObserver
-import android.view.WindowManager
 import android.view.inputmethod.InputMethodManager
 import android.webkit.CookieManager
 import android.webkit.WebChromeClient
@@ -26,9 +23,12 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -36,6 +36,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
@@ -308,30 +309,18 @@ private val EDITING_BRIDGE_JS = """
           base = vh;
           window.__vegaBaseVh = vh;
         }
-        // The native side keeps the WebView at full size while the IME is up
-        // (resizing a platform view is what closes the keyboard on some TV
-        // firmware) and publishes the keyboard height in CSS pixels. End the
-        // band just above it. When a pre-30 firmware cannot report the inset,
-        // fall back to a conservative overlay band; the target is the centre
-        // of the available space either way.
-        var ime = window.__vegaImePx || 0;
-        if (!(ime > 0 && ime < vh * 0.75)) ime = 0;
-        var bandTop = vh * 0.06;
-        var bandBottom;
-        if (ime > 0) {
-          bandBottom = vh - ime - 12;
-        } else if (base > 0 && vh < base * 0.9) {
-          bandBottom = vh * 0.75;
-        } else {
-          bandBottom = vh * 0.40;
-        }
-        if (bandBottom > vh - 8) bandBottom = vh - 8;
+        // A 10% shrink is the keyboard; small height changes are page chrome.
+        var shrank = base > 0 && vh < base * 0.9;
+        var bandTop = vh * (shrank ? 0.08 : 0.06);
+        var bandBottom = vh * (shrank ? 0.75 : 0.40);
+        var targetRatio = shrank ? 0.40 : 0.25;
         var r = el.getBoundingClientRect();
         if (bandBottom < bandTop + r.height + 20) {
-          bandBottom = Math.min(vh, bandTop + r.height + 20);
+          bandBottom = bandTop + r.height + 20;
         }
+        if (bandBottom > vh) bandBottom = vh;
         var inBand = r.top >= bandTop && r.bottom <= bandBottom;
-        var target = (bandTop + bandBottom) / 2 - r.height / 2;
+        var target = vh * targetRatio - r.height / 2;
         target = Math.max(bandTop, Math.min(target, bandBottom - r.height));
         // Typing only re-checks the band. A forced pass (focus, IME open,
         // viewport resize, and the native timed passes) also moves a field
@@ -584,41 +573,32 @@ private val SPATIAL_NAV_JS = """
     })()
 """.trimIndent()
 
-private fun Context.findActivity(): Activity? = when (this) {
-    is Activity -> this
-    is ContextWrapper -> baseContext.findActivity()
-    else -> null
-}
-
 private const val IME_TAG = "VegaWafIme"
 
+// A TV keyboard window stays up for as long as the viewer types. A focus loss
+// shorter than this is the IME's own opening bounce, not a typing session.
+private const val WINDOW_LOSS_MIN_MS = 1_500L
+
 /**
- * Shows the page keyboard.
+ * Shows the page keyboard exactly as 1.1.7 did, the last release the viewer
+ * confirmed the keyboard appears promptly on.
  *
- * Focus is requested only when the WebView does not already have it. Calling
- * `requestFocus()` again while the IME is opening can move window focus for a
- * frame, and some TV firmware answers that by dismissing the keyboard it just
- * showed. The actual show request is posted once, after the page has had time
- * to create its input connection.
+ * `requestFocus()` is called unconditionally. The WebView usually has view
+ * focus already, but on TV firmware it may not be the window's focused view
+ * while the Compose toolbar or the IME window owns window focus. Skipping the
+ * request when `hasFocus()` is true (the 1.1.8 change) left the keyboard
+ * waiting for the viewer to press a D-pad key first. The show itself is posted
+ * after the page has had time to create its input connection.
  */
 private fun WebView.showIme() {
     isFocusable = true
     isFocusableInTouchMode = true
-    if (!hasFocus() && !requestFocus()) requestFocusFromTouch()
-    postDelayed({ showImeSoft() }, 120)
-}
-
-/**
- * Asks the IME to show without touching focus. Used for the short rescue pass:
- * if the first show ran before Chromium had an input connection, this retries
- * while never stealing focus from the keyboard window.
- */
-private fun WebView.showImeSoft() {
-    if (!isAttachedToWindow) return
-    val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
-    val shown = imm?.showSoftInput(this, InputMethodManager.SHOW_IMPLICIT) == true
-    ViewCompat.getWindowInsetsController(this)?.show(WindowInsetsCompat.Type.ime())
-    Log.i(IME_TAG, "showImeSoft shown=$shown focus=${hasFocus()} ime=${imeVisible()}")
+    if (!requestFocus()) requestFocusFromTouch()
+    postDelayed({
+        val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+        imm?.showSoftInput(this, InputMethodManager.SHOW_IMPLICIT)
+        ViewCompat.getWindowInsetsController(this)?.show(WindowInsetsCompat.Type.ime())
+    }, 120)
 }
 
 private fun WebView.imeVisible(): Boolean {
@@ -692,18 +672,12 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
     // a frame or two after hideSoftInput; without this the observer below
     // would immediately re-adopt it and hide the cursor again.
     val imeSuppressedUntil = remember { AtomicLong(0L) }
-    // Rate-limits keyboard show requests. Re-requesting focus while a TV IME
-    // window owns it dismisses the keyboard it just showed, so a repeated
-    // beginEditing (key repeat, repeated bridge focus reports) must not
-    // trigger another show.
-    val lastImeShowAt = remember { AtomicLong(0L) }
     // TV keyboards are often their own window or activity: BACK finishes that
     // window and the app never sees the key, so `editing` would stay true and
-    // the cursor would stay buried. These track the keyboard lifecycle so the
-    // cursor can be restored without ever hiding a keyboard that is still up.
-    val imeSeenWhileEditing = remember { AtomicBoolean(false) }
-    val windowLostWhileEditing = remember { AtomicBoolean(false) }
-    val editingSince = remember { AtomicLong(0L) }
+    // the cursor would stay buried. This records when the app last lost window
+    // focus to the keyboard window, so a real typing session can be told apart
+    // from the IME's opening bounce.
+    val windowLostAt = remember { AtomicLong(0L) }
     // Called from the WebView's window-focus callback (main thread). Replaced
     // on every composition so it always reads the current editing state.
     val windowFocusAction = remember { AtomicReference<(Boolean) -> Unit>({}) }
@@ -779,13 +753,11 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
         val started = !editing
         editing = true
         pointerOverlay?.visibility = View.GONE
-        // Record the pre-keyboard viewport before the IME opens. With the
-        // window kept at its own size this stays the full height, which is
-        // what the page uses to choose its fallback band.
+        // Record the pre-keyboard viewport before the IME opens. With
+        // `imePadding` the WebView itself shrinks, which is what tells the
+        // page to use the roomy band above the keyboard.
         if (started) {
-            editingSince.set(SystemClock.uptimeMillis())
-            imeSeenWhileEditing.set(false)
-            windowLostWhileEditing.set(false)
+            windowLostAt.set(0L)
             runCatching {
                 wv.evaluateJavascript(
                     "window.__vegaBaseVh=Math.max(window.__vegaBaseVh||0,window.innerHeight||0);'saved'",
@@ -794,14 +766,11 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
             }
             status = "Keyboard open — type, then press BACK to close it"
         }
-        // Show at most once per request window. Asking again while a TV IME
-        // window owns the keyboard is what makes it disappear right after it
-        // appeared; repeated bridge reports must only reposition the field.
-        val now = SystemClock.uptimeMillis()
-        if (now - lastImeShowAt.get() > 600L) {
-            lastImeShowAt.set(now)
-            wv.postDelayed({ if (editing) wv.showIme() }, 16)
-        }
+        // Re-assert the show on every entry. 1.1.7 did this and its keyboard
+        // appeared promptly; the 1.1.8 throttle skipped the retry that lands
+        // after Chromium has finally created the input connection, which is
+        // exactly the "slow or never appears" symptom.
+        wv.postDelayed({ if (editing) wv.showIme() }, 16)
         // A page can focus a field before onPageFinished has installed the
         // bridge. Injecting here is idempotent: the first call installs it,
         // later calls only report the current focus and re-assert the band.
@@ -821,13 +790,12 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
         // Suppress adoption long enough that slow TV firmware cannot re-adopt
         // it and reopen the keyboard under the viewer's hands after BACK.
         imeSuppressedUntil.set(SystemClock.uptimeMillis() + 4_000)
-        imeSeenWhileEditing.set(false)
-        windowLostWhileEditing.set(false)
+        windowLostAt.set(0L)
         val wv = webView
         if (wv != null) {
             runCatching {
                 wv.evaluateJavascript(
-                    "window.__vegaImePx=0;window.__vegaReveal&&window.__vegaReveal()",
+                    "window.__vegaReveal&&window.__vegaReveal()",
                     null,
                 )
             }
@@ -863,32 +831,39 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
     }
 
     // A full-screen TV keyboard is its own window: BACK finishes that window
-    // and the app only sees focus return, so `editing` never gets cleared. If
-    // focus comes back and the IME is verifiably gone, restore the cursor; if
-    // the IME is still visible, leave the viewer's keyboard alone.
+    // and the app only sees focus return, so `editing` never gets cleared. A
+    // focus return is only trusted after the keyboard window has been away for
+    // long enough to be a real session: the IME's own opening bounce also
+    // loses and returns focus, and treating that as "closed" restored the
+    // cursor and took focus back while the keyboard was still coming up.
     windowFocusAction.set { hasFocus ->
         if (!hasFocus) {
-            if (editing) windowLostWhileEditing.set(true)
-        } else if (editing && windowLostWhileEditing.getAndSet(false)) {
-            val wv = webView
-            if (wv != null) {
-                // The IME inset can trail the focus change by a frame or two.
-                // Poll briefly instead of checking once and giving up; every
-                // check still requires the IME to be verifiably gone.
-                var attempts = 0
-                val check = object : Runnable {
-                    override fun run() {
-                        if (!editing) return
-                        val current = webView ?: return
-                        if (!current.imeVisible()) {
-                            Log.i(IME_TAG, "IME window closed without BACK; restoring cursor")
-                            finishEditing()
-                        } else if (++attempts < 8) {
-                            current.postDelayed(this, 250)
+            if (editing) windowLostAt.compareAndSet(0L, SystemClock.uptimeMillis())
+        } else if (editing) {
+            val lostAt = windowLostAt.getAndSet(0L)
+            if (lostAt != 0L &&
+                SystemClock.uptimeMillis() - lostAt >= WINDOW_LOSS_MIN_MS
+            ) {
+                val wv = webView
+                if (wv != null) {
+                    // The IME inset can trail the focus change by a frame or
+                    // two. Poll briefly instead of checking once and giving
+                    // up; every check still requires the IME to be gone.
+                    var attempts = 0
+                    val check = object : Runnable {
+                        override fun run() {
+                            if (!editing) return
+                            val current = webView ?: return
+                            if (!current.imeVisible()) {
+                                Log.i(IME_TAG, "IME window closed; restoring cursor")
+                                finishEditing()
+                            } else if (++attempts < 8) {
+                                current.postDelayed(this, 250)
+                            }
                         }
                     }
+                    wv.postDelayed(check, 250)
                 }
-                wv.postDelayed(check, 250)
             }
         }
     }
@@ -1199,139 +1174,81 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
         }
     }
 
-    // 1.1.3 opened the keyboard with the window kept at its own size
-    // (`SOFT_INPUT_ADJUST_NOTHING`). 1.1.4 replaced that with `imePadding()`,
-    // which resizes the platform WebView while the IME animates; on several TV
-    // firmware builds that resize ends the input connection and the keyboard
-    // closes a moment after it appeared. Keep the window fixed and do all
-    // positioning by scrolling the page.
+    // The manifest requests adjustResize; edge-to-edge keeps the window its own
+    // size and reports the keyboard as an inset, which `imePadding()` consumes.
+    // API 29 and some TV firmware do not report that inset, so the layout
+    // observer keeps the visible-display-frame height as a fallback. It is
+    // applied only when the real inset is 0 — never both, or the page would be
+    // padded twice and the field would float above the toolbar for no reason.
     val localView = LocalView.current
-    val latestWebView = rememberUpdatedState(webView)
+    var legacyImePx by remember { mutableIntStateOf(0) }
     DisposableEffect(localView) {
-        val activity = localView.context.findActivity()
-        val window = activity?.window
-        val previousSoftInput = window?.attributes?.softInputMode
-        runCatching {
-            window?.setSoftInputMode(
-                WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING or
-                    WindowManager.LayoutParams.SOFT_INPUT_STATE_UNCHANGED,
-            )
-        }
-        var lastImePx = -1
-        fun publishIme(px: Int) {
-            if (px == lastImePx) return
-            lastImePx = px
-            val wv = latestWebView.value ?: return
-            val css = px / localView.resources.displayMetrics.density
-            wv.post {
-                // The page ends its reveal band just above the keyboard. The
-                // native side never moves or resizes the WebView.
-                wv.evaluateJavascript(
-                    "window.__vegaImePx=$css;window.__vegaRevealForce&&window.__vegaRevealForce()",
-                    null,
-                )
-            }
-        }
-        // Insets are dispatched to every attached child, so a zero-sized probe
-        // reads the IME height without touching Compose's own inset handling.
-        val root = localView.rootView as? ViewGroup
-        val probe = View(localView.context).apply {
-            isFocusable = false
-            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
-        }
-        runCatching {
-            root?.addView(probe, ViewGroup.LayoutParams(0, 0))
-            ViewCompat.requestApplyInsets(probe)
-            ViewCompat.setOnApplyWindowInsetsListener(probe) { _, insets ->
-                if (Build.VERSION.SDK_INT >= 30) {
-                    publishIme(insets.getInsets(WindowInsetsCompat.Type.ime()).bottom)
-                }
-                insets
-            }
-        }
-        // API 29 and some TV firmware do not expose the IME inset. The visible
-        // display frame is the platform's own fallback, and when even that does
-        // not shrink (ADJUST_NOTHING) the page uses its top-40% band, which is
-        // above every TV keyboard.
-        val layoutListener = ViewTreeObserver.OnGlobalLayoutListener {
-            if (Build.VERSION.SDK_INT >= 30) return@OnGlobalLayoutListener
+        val observer = ViewTreeObserver.OnGlobalLayoutListener {
             val frame = Rect()
             localView.getWindowVisibleDisplayFrame(frame)
             val height = localView.rootView.height
-            val px = if (height > 0 && height - frame.bottom > height * 0.15f) {
+            legacyImePx = if (height > 0 && height - frame.bottom > height * 0.15f) {
                 height - frame.bottom
             } else {
                 0
             }
-            publishIme(px)
         }
-        localView.viewTreeObserver.addOnGlobalLayoutListener(layoutListener)
+        localView.viewTreeObserver.addOnGlobalLayoutListener(observer)
         onDispose {
-            runCatching { localView.viewTreeObserver.removeOnGlobalLayoutListener(layoutListener) }
-            runCatching { root?.removeView(probe) }
-            runCatching {
-                if (previousSoftInput != null) window?.setSoftInputMode(previousSoftInput)
-            }
-            runCatching {
-                latestWebView.value?.evaluateJavascript("window.__vegaImePx=0;", null)
-            }
+            runCatching { localView.viewTreeObserver.removeOnGlobalLayoutListener(observer) }
             runCatching { CookieManager.getInstance().flush() }
         }
     }
+    val imeBottomPx = WindowInsets.ime.getBottom(density)
+    // The visible-frame estimate is only a pre-30 fallback: on 30+ the real
+    // inset is authoritative, and mixing the two during the close animation
+    // would add a frame of phantom padding as one reaches zero before the
+    // other.
+    val manualImePx =
+        if (Build.VERSION.SDK_INT >= 30 || imeBottomPx > 0) 0 else legacyImePx
 
-    // The IME opens at its own pace, so force the active field into the band
-    // for ~2.4s. Two focus-free show attempts rescue a first show that ran
-    // before Chromium had an input connection. Nothing here ever hides the IME
-    // or requests focus — both are what used to make TV keyboards vanish.
+    // The IME opens at its own pace and the WebView height settles over
+    // several frames. The bridge re-reveals on resize/input, but a slow TV
+    // keyboard can report neither, so force the active field into the band for
+    // ~2.4s. While the page still reports an editable, also re-assert the IME:
+    // a page that re-renders an input can drop the input connection and the
+    // keyboard would otherwise close under the viewer's hands. Once editing
+    // ends (BACK/MENU) this loop stops; nothing here ever hides the IME.
     LaunchedEffect(editing, webView) {
         val wv = webView ?: return@LaunchedEffect
         if (!editing) return@LaunchedEffect
         repeat(12) { pass ->
-            delay(if (pass == 0) 80L else 200L)
+            delay(if (pass == 0) 80L else 220L)
             if (!editing) return@LaunchedEffect
             wv.evaluateJavascript(
                 "window.__vegaRevealForce&&window.__vegaRevealForce()",
                 null,
             )
-            if (pass == 2 || pass == 5) wv.showImeSoft()
+            if (pass < 10) {
+                wv.evaluateJavascript(ACTIVE_TEXT_FIELD_JS) { result ->
+                    if (editing && result?.contains("editable") == true) wv.showIme()
+                }
+            }
         }
     }
 
     // The keyboard is not only opened by our tap probe: a page can focus a
     // field itself on load. This observer adopts an IME it can actually see.
-    // It also notices when a keyboard closes without our BACK path (the IME
-    // window consumed the key): on API 30+ the IME inset is authoritative, so
-    // three consecutive "hidden" polls after a keyboard that was seen up mean
-    // the viewer is done typing. The state-only restore below never hides an
-    // IME, and older firmware (where the frame fallback can report "hidden"
-    // while the keyboard is up) is left to the window-focus path.
+    // It never ends editing: on TV firmware, under FLAG_LAYOUT_NO_LIMITS and
+    // for an IME in its own window, imeVisible() reports false while the
+    // keyboard is visibly up. The old "seen then unseen" path called
+    // endEditing() and really hid the keyboard the viewer was typing on; that
+    // is the 1.1.6 regression 1.1.7 removed, and 1.1.9 reintroduced it as the
+    // API 30+ vanish check. Only BACK/MENU ends editing; a keyboard window
+    // that consumes BACK is covered by the window-focus path.
     LaunchedEffect(webView) {
         val wv = webView ?: return@LaunchedEffect
-        var hiddenPolls = 0
         while (true) {
             delay(300)
-            val imeVisible = wv.imeVisible()
-            if (!editing) {
-                hiddenPolls = 0
-                if (imeVisible && SystemClock.uptimeMillis() > imeSuppressedUntil.get()) {
-                    beginEditing(wv)
-                }
-                continue
-            }
-            if (imeVisible) {
-                imeSeenWhileEditing.set(true)
-                hiddenPolls = 0
-                continue
-            }
-            if (Build.VERSION.SDK_INT >= 30 &&
-                imeSeenWhileEditing.get() &&
-                SystemClock.uptimeMillis() - editingSince.get() > 1_500L
+            if (!editing && wv.imeVisible() &&
+                SystemClock.uptimeMillis() > imeSuppressedUntil.get()
             ) {
-                if (++hiddenPolls >= 3) {
-                    Log.i(IME_TAG, "IME vanished while editing; restoring cursor")
-                    finishEditing()
-                    hiddenPolls = 0
-                }
+                beginEditing(wv)
             }
         }
     }
@@ -1386,6 +1303,8 @@ fun WafScreen(url: String, onSolved: () -> Unit, onClose: () -> Unit) {
     Column(
         Modifier
             .fillMaxSize()
+            .imePadding()
+            .padding(bottom = with(density) { manualImePx.toDp() })
             .onPreviewKeyEvent { event ->
                 // Moving down from the toolbar enters the page. Keys inside
                 // the WebView never reach Compose, which is what we want.

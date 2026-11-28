@@ -21,6 +21,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -35,18 +36,24 @@ import java.util.concurrent.atomic.AtomicInteger;
  * ordered chunks on up to four sockets only when the measured rate is below
  * the fixed "too slow for video" floor.
  *
- * <p>That floor is deliberately low (1.5 MB/s, the same value the official
- * client uses). A player only reads as fast as it consumes once its forward
- * buffer is full, so a healthy 90 Mbps film measures roughly 11 MB/s — its own
- * bitrate, not the link's capacity. A higher threshold therefore switches
- * almost every 4K film onto parallel ranges for no reason. Below 1.5 MB/s no
- * video bitrate can be sustained at all, so a switch there is unambiguous.
+ * <p>The absolute floor is deliberately low (1.5 MB/s, the same value the
+ * official client uses): below it no video bitrate can be sustained at all.
+ * That floor alone misses the common case where one socket delivers 5 MB/s
+ * while the film needs 11 MB/s, so the load control also publishes the
+ * selected video+audio bitrate and the source treats one connection as too
+ * slow when it cannot deliver that bitrate with 25% headroom. A genuinely
+ * healthy connection measures its link speed during refill bursts, not the
+ * film's consumption rate, so it stays above the line; when the container
+ * declares no bitrate the absolute floor still applies.
  *
  * <p>The decision is still conservative. A fast start is not treated as proof:
- * the measurement runs in three-second / 512-KB windows for as long as the
- * open stays on one connection, so a connection that starts fast and is then
- * shaped still triggers a switch. A switch always happens at the exact byte
- * the player has reached, so nothing is downloaded twice and no data is lost.
+ * the measurement runs in 1.5-second / 1-MB windows for as long as the open
+ * stays on one connection, so a connection that starts fast and is then shaped
+ * still triggers a switch. A real playback stall with less than 2 s buffered is
+ * even stronger evidence: it switches at once instead of waiting for a window
+ * that the burst before the stall could flatter. A switch always happens at
+ * the exact byte the player has reached, so nothing is downloaded twice and no
+ * data is lost.
  *
  * <p>Once chunks are running, the source measures their aggregate delivery
  * rate. If parallel requests do not beat the single request by a real margin,
@@ -64,7 +71,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  * <p>Any open that still has at least {@link #MIN_PARALLEL_BYTES} left to
  * stream is measured and may switch, not just multi-gigabyte files: a 300 MB
  * episode on a throttled host stalls the same way an 80 GB remux does. A
- * connection that delivers at least {@link #SLOW_BYTES_PER_SECOND} stays
+ * connection that delivers the bitrate it needs stays
  * single. Small HLS segments, subtitles, playlists and
  * the bounded 64 KB Matroska probes stay single-request. A URL that already
  * benefited engages at once on later seeks. A 429 or 503 permanently lowers
@@ -77,19 +84,32 @@ public final class ParallelRangeDataSource implements DataSource {
 
     static final int MAX_CONNECTIONS = 4;
 
-    /** A switch needs this much blocked time and this many delivered bytes. */
-    private static final long MEASURE_MIN_NANOS = 3_000_000_000L;
-    private static final long MEASURE_MIN_BYTES = 512L * 1024L;
     /**
-     * Below this, one connection cannot sustain any video bitrate. The official
-     * client uses the same floor and for the same reason: once the player's
-     * forward buffer is full it only reads at playback speed, so the measured
-     * rate of a healthy 90 Mbps film is ~11 MB/s — its bitrate, not the link.
-     * A threshold derived from the bitrate or the file size would therefore
-     * engage parallel ranges on nearly every large film. Only a genuinely
-     * starved connection (under ~12 Mbps) trips this.
+     * A measurement window needs this much blocked time and this many
+     * delivered bytes. 1.5 s is long enough to leave TCP slow start behind and
+     * short enough to switch before a draining buffer empties.
+     */
+    private static final long MEASURE_MIN_NANOS = 1_500_000_000L;
+    private static final long MEASURE_MIN_BYTES = 1024L * 1024L;
+    /**
+     * The absolute floor: below this, one connection cannot sustain any video
+     * bitrate, whatever the film. The bitrate-aware threshold above it is what
+     * catches a connection that is faster than this but still slower than the
+     * film.
      */
     private static final long SLOW_BYTES_PER_SECOND = 1_500_000L;
+    /**
+     * Headroom over the film's own bitrate. A connection that merely equals
+     * the bitrate has no cushion for jitter, and its buffer fills too slowly
+     * to survive a hiccup.
+     */
+    private static final long SLOW_HEADROOM_PERCENT = 125L;
+    /**
+     * A stall switch still wants a rate for the gain check, but it must not
+     * wait for a full window while playback is stopped.
+     */
+    private static final long STARVATION_MIN_NANOS = 250_000_000L;
+    private static final long STARVATION_MIN_BYTES = 256L * 1024L;
 
     private static final int FIRST_CHUNK_BYTES = 1024 * 1024;
     private static final int MAX_CHUNK_BYTES = 8 * 1024 * 1024;
@@ -134,6 +154,11 @@ public final class ParallelRangeDataSource implements DataSource {
     private static final ExecutorService WORKERS = Executors.newCachedThreadPool(runnable -> {
         Thread thread = new Thread(runnable, "VegaParallelStream");
         thread.setDaemon(true);
+        // A cached pool has no uncaught-exception handler of its own, so an
+        // escaping throwable would reach Android's default handler and kill
+        // the process. Log it and let the engine fall back instead.
+        thread.setUncaughtExceptionHandler((failed, error) ->
+                Log.e(TAG, "Uncaught failure on " + failed.getName(), error));
         return thread;
     });
 
@@ -169,6 +194,7 @@ public final class ParallelRangeDataSource implements DataSource {
     private final DataSource.Factory singleFactory;
     private final DataSource.Factory chunkFactory;
     private final DataSource single;
+    private final BufferSignals signals;
     private final List<TransferListener> transferListeners = new ArrayList<>();
 
     @Nullable private DataSpec dataSpec;
@@ -188,11 +214,15 @@ public final class ParallelRangeDataSource implements DataSource {
     private long measuredNanos;
     private long measuredBytes;
     private long lastSingleRate;
+    /** Stall count when this open began; only later stalls belong to it. */
+    private long seenStarvations;
 
     private ParallelRangeDataSource(
-            DataSource.Factory singleFactory, DataSource.Factory chunkFactory) {
+            DataSource.Factory singleFactory, DataSource.Factory chunkFactory,
+            BufferSignals signals) {
         this.singleFactory = singleFactory;
         this.chunkFactory = chunkFactory;
+        this.signals = signals;
         this.single = singleFactory.createDataSource();
     }
 
@@ -222,6 +252,7 @@ public final class ParallelRangeDataSource implements DataSource {
         measuredNanos = 0;
         measuredBytes = 0;
         lastSingleRate = 0;
+        seenStarvations = signals.starvationCount.get();
 
         boolean eligible = suitable(dataSpec);
         UrlState state = eligible ? urlState(dataSpec.uri) : null;
@@ -260,6 +291,11 @@ public final class ParallelRangeDataSource implements DataSource {
         } catch (IOException error) {
             singleOpen = false;
             throw error;
+        } catch (RuntimeException error) {
+            // Keep unchecked failures from a data source out of ExoPlayer's
+            // loading thread; an IOException is a normal playback error.
+            singleOpen = false;
+            throw new IOException("Could not open the stream", error);
         }
         responseHeaders = single.getResponseHeaders();
 
@@ -451,11 +487,17 @@ public final class ParallelRangeDataSource implements DataSource {
             // parallel playback for the whole session.
         } catch (IOException error) {
             // A transient probe failure proves nothing either way.
+        } catch (RuntimeException error) {
+            // A source closed under the probe must not disable parallel
+            // playback for the whole session, nor escape into open().
+            Log.w(TAG, "Range probe failed", error);
         } finally {
             try {
                 probe.close();
             } catch (IOException ignored) {
                 // The probe result is already decided.
+            } catch (RuntimeException error) {
+                Log.w(TAG, "Closing the range probe failed", error);
             }
         }
     }
@@ -473,23 +515,24 @@ public final class ParallelRangeDataSource implements DataSource {
                 }
                 return read;
             } catch (FallbackException fallback) {
-                Log.i(TAG, "Back to one connection: " + fallback.getMessage());
-                engine.close();
-                engine = null;
-                UrlState state = dataSpec == null ? null : urlState(dataSpec.uri);
-                if (state != null) {
-                    // Measure again on the next open instead of re-engaging
-                    // blind; a host that just refused four sockets may allow
-                    // two, and the gate will find that out.
-                    state.parallelVerified = false;
-                }
-                reopenSingle();
-                setDiagnostics("single - fell back from parallel");
+                fallBackToSingle(fallback.getMessage());
+            } catch (RuntimeException error) {
+                // A source closed under a blocked read, or a defect inside the
+                // engine, must never escape as an unchecked exception: on the
+                // loading thread it can stop playback outright. Degrade to one
+                // request and keep the stream running.
+                Log.e(TAG, "Parallel read failed; continuing on one connection", error);
+                fallBackToSingle("parallel read failed");
             }
         }
 
         long started = measuring ? System.nanoTime() : 0L;
-        int read = single.read(buffer, offset, length);
+        int read;
+        try {
+            read = single.read(buffer, offset, length);
+        } catch (RuntimeException error) {
+            throw new IOException("Could not read the stream", error);
+        }
         if (read > 0) {
             position += read;
         }
@@ -504,7 +547,8 @@ public final class ParallelRangeDataSource implements DataSource {
                 long remaining = endPosition == C.LENGTH_UNSET
                         ? C.LENGTH_UNSET
                         : endPosition - position;
-                if (rate < SLOW_BYTES_PER_SECOND
+                long threshold = slowThresholdBytesPerSecond();
+                if (rate < threshold
                         && remaining >= MIN_PARALLEL_BYTES) {
                     measuring = false;
                     switchToParallel(rate);
@@ -513,11 +557,88 @@ public final class ParallelRangeDataSource implements DataSource {
                     // burst at the start of a stream is often followed by the
                     // real, shaped rate.
                     setDiagnostics(String.format(Locale.US,
-                            "single - %.1f MB/s", rate / 1e6));
+                            "single - %.1f MB/s (need %.1f)",
+                            rate / 1e6, threshold / 1e6));
                 }
             }
+            maybeSwitchOnStarvation();
         }
         return read;
+    }
+
+    /**
+     * The single-connection rate below which parallel ranges are worth trying.
+     *
+     * <p>The absolute floor catches a connection that cannot sustain any video
+     * at all. The selected bitrate catches the much more common case where one
+     * socket is faster than that floor but still slower than the film, which
+     * the old fixed gate never noticed: a 90 Mbps remux needs 11.25 MB/s, so a
+     * 5 MB/s connection sat below the film and above the floor forever. The
+     * 25% headroom keeps the line away from a connection that merely equals
+     * the bitrate and therefore has no cushion for jitter. When the container
+     * declares no bitrate the floor still applies.
+     */
+    private long slowThresholdBytesPerSecond() {
+        long bitsPerSecond = signals.selectedBitrateBitsPerSecond.get();
+        if (bitsPerSecond <= 0) {
+            return SLOW_BYTES_PER_SECOND;
+        }
+        long bitrateBytesPerSecond = bitsPerSecond / 8L;
+        long headroom = bitrateBytesPerSecond * (SLOW_HEADROOM_PERCENT - 100L) / 100L;
+        return Math.max(SLOW_BYTES_PER_SECOND, bitrateBytesPerSecond + headroom);
+    }
+
+    /**
+     * A real playback stall with a nearly empty buffer is proof that one
+     * connection could not feed the player, regardless of what an average
+     * says. Switch at once; the chunk engine still verifies that parallel
+     * requests actually help, and the URL is remembered as single if they do
+     * not.
+     */
+    private void maybeSwitchOnStarvation() {
+        if (engine != null || !measuring || dataSpec == null
+                || signals.starvationCount.get() == seenStarvations) {
+            return;
+        }
+        UrlState state = urlState(dataSpec.uri);
+        if (state.unsuitable || state.parallelUnhelpful || !state.rangeProven
+                || endPosition == C.LENGTH_UNSET
+                || endPosition - position < MIN_PARALLEL_BYTES) {
+            return;
+        }
+        seenStarvations = signals.starvationCount.get();
+        long rate = lastSingleRate;
+        if (measuredNanos >= STARVATION_MIN_NANOS && measuredBytes >= STARVATION_MIN_BYTES) {
+            rate = measuredBytes * 1_000_000_000L / measuredNanos;
+        }
+        measuring = false;
+        switchToParallel(rate);
+    }
+
+    /**
+     * Drops the chunk engine after a failure and resumes the same open over one
+     * normal request.
+     *
+     * <p>Called from {@link #read}, so the playback position is exactly where
+     * the engine stopped and no bytes are repeated. A failed parallel phase
+     * must degrade to ordinary streaming rather than stop playback.
+     */
+    private void fallBackToSingle(@Nullable String reason) throws IOException {
+        Log.i(TAG, "Back to one connection: " + reason);
+        Engine failed = engine;
+        engine = null;
+        if (failed != null) {
+            failed.close();
+        }
+        UrlState state = dataSpec == null ? null : urlState(dataSpec.uri);
+        if (state != null) {
+            // Measure again on the next open instead of re-engaging blind; a
+            // host that just refused four sockets may allow two, and the gate
+            // will find that out.
+            state.parallelVerified = false;
+        }
+        reopenSingle();
+        setDiagnostics("single - fell back from parallel");
     }
 
     /** Leaves the single request at the current byte and starts ordered chunks. */
@@ -564,6 +685,7 @@ public final class ParallelRangeDataSource implements DataSource {
                 // The server may still count the parallel requests for a moment.
                 if ((e.responseCode != 429 && e.responseCode != 503)
                         || attempt >= MAX_REOPEN_ATTEMPTS) {
+                    closeSingleQuietly();
                     throw e;
                 }
                 closeSingleQuietly();
@@ -573,6 +695,9 @@ public final class ParallelRangeDataSource implements DataSource {
                     Thread.currentThread().interrupt();
                     throw new java.io.InterruptedIOException();
                 }
+            } catch (RuntimeException error) {
+                closeSingleQuietly();
+                throw new IOException("Could not reopen the stream", error);
             }
         }
     }
@@ -591,15 +716,20 @@ public final class ParallelRangeDataSource implements DataSource {
     @Override
     public void close() throws IOException {
         measuring = false;
-        if (engine != null) {
-            engine.close();
-            engine = null;
+        Engine current = engine;
+        engine = null;
+        if (current != null) {
+            current.close();
         }
         dataSpec = null;
         responseHeaders = Collections.emptyMap();
         if (singleOpen) {
             singleOpen = false;
-            single.close();
+            try {
+                single.close();
+            } catch (RuntimeException error) {
+                throw new IOException("Could not close the stream", error);
+            }
         }
     }
 
@@ -612,6 +742,8 @@ public final class ParallelRangeDataSource implements DataSource {
             single.close();
         } catch (IOException ignored) {
             // The replacement request reports its own errors.
+        } catch (RuntimeException error) {
+            Log.w(TAG, "Closing the single request failed", error);
         }
     }
 
@@ -756,6 +888,37 @@ public final class ParallelRangeDataSource implements DataSource {
         }
     }
 
+    /**
+     * One chunk request owned by the engine. The worker that created it and
+     * {@link Engine#close()} may both close it, and the CAS makes sure the
+     * underlying source is closed exactly once even when they race.
+     */
+    private static final class ManagedSource {
+        final DataSource source;
+        private final AtomicBoolean closed = new AtomicBoolean();
+
+        ManagedSource(DataSource source) {
+            this.source = source;
+        }
+
+        boolean isClosed() {
+            return closed.get();
+        }
+
+        void closeQuietly() {
+            if (!closed.compareAndSet(false, true)) {
+                return;
+            }
+            try {
+                source.close();
+            } catch (IOException ignored) {
+                // Every worker reports its own result.
+            } catch (RuntimeException error) {
+                Log.w(TAG, "Closing a chunk request failed", error);
+            }
+        }
+    }
+
     /** Downloads the chunks just ahead of the player and hands their bytes over in order. */
     private final class Engine {
         private final Object lock = new Object();
@@ -765,8 +928,8 @@ public final class ParallelRangeDataSource implements DataSource {
         private final AtomicInteger hostLimit;
         private final long singleRate;
         private final ArrayDeque<Chunk> chunks = new ArrayDeque<>();
-        private final Set<DataSource> activeSources =
-                Collections.newSetFromMap(new ConcurrentHashMap<DataSource, Boolean>());
+        private final Set<ManagedSource> activeSources =
+                Collections.newSetFromMap(new ConcurrentHashMap<ManagedSource, Boolean>());
 
         private long readPosition;
         private long nextChunkStart;
@@ -817,6 +980,12 @@ public final class ParallelRangeDataSource implements DataSource {
                     Chunk head = chunks.peekFirst();
                     if (head != null) {
                         int offsetInChunk = (int) (readPosition - head.start);
+                        if (offsetInChunk < 0 || offsetInChunk > head.filled) {
+                            // The bookkeeping and the buffered bytes disagree;
+                            // continuing would throw out of read() or return
+                            // the wrong part of the film. Fall back instead.
+                            throw new FallbackException("invalid chunk position");
+                        }
                         int available = head.filled - offsetInChunk;
                         if (available > 0) {
                             int count = Math.min(length, available);
@@ -843,7 +1012,7 @@ public final class ParallelRangeDataSource implements DataSource {
         }
 
         void close() {
-            ArrayList<DataSource> toClose;
+            ArrayList<ManagedSource> toClose;
             synchronized (lock) {
                 closed = true;
                 chunks.clear();
@@ -852,12 +1021,8 @@ public final class ParallelRangeDataSource implements DataSource {
                 activeSources.clear();
                 lock.notifyAll();
             }
-            for (DataSource source : toClose) {
-                try {
-                    source.close();
-                } catch (IOException ignored) {
-                    // Every worker reports its own result.
-                }
+            for (ManagedSource source : toClose) {
+                source.closeQuietly();
             }
         }
 
@@ -889,7 +1054,31 @@ public final class ParallelRangeDataSource implements DataSource {
                 if (!chunk.running && chunk.filled < chunk.data.length && now >= chunk.notBefore) {
                     chunk.running = true;
                     running++;
-                    WORKERS.execute(() -> download(chunk));
+                    WORKERS.execute(() -> runChunk(chunk));
+                }
+            }
+        }
+
+        /**
+         * Runs one chunk download and keeps any escaping failure off the
+         * process.
+         *
+         * <p>The worker pool is a plain cached pool, so an unchecked exception
+         * on one of its threads would reach Android's default handler and kill
+         * the app. {@link #download} already turns source failures into a
+         * fallback; this is the last line of defence for anything thrown by
+         * the bookkeeping around it.
+         */
+        private void runChunk(Chunk chunk) {
+            try {
+                download(chunk);
+            } catch (Throwable error) {
+                Log.e(TAG, "Chunk worker failed", error);
+                synchronized (lock) {
+                    if (!closed && fallbackReason == null) {
+                        fallbackReason = "chunk worker failed";
+                    }
+                    lock.notifyAll();
                 }
             }
         }
@@ -931,12 +1120,31 @@ public final class ParallelRangeDataSource implements DataSource {
                     for (TransferListener listener : transferListeners) {
                         source.addTransferListener(listener);
                     }
-                    activeSources.add(source);
+                    ManagedSource managed = new ManagedSource(source);
+                    boolean added = false;
+                    synchronized (lock) {
+                        if (!closed) {
+                            activeSources.add(managed);
+                            added = true;
+                        }
+                    }
+                    if (!added) {
+                        managed.closeQuietly();
+                        return;
+                    }
+                    // Engine.close() may have run between the check above and
+                    // this point; it closed (or is about to close) this source.
+                    if (managed.isClosed()) {
+                        return;
+                    }
                     try {
                         source.open(spec.buildUpon()
                                 .setPosition(from)
                                 .setLength(chunk.end() - from)
                                 .build());
+                        if (managed.isClosed()) {
+                            return;
+                        }
                         long[] range = parseContentRange(source.getResponseHeaders());
                         if (range == null) {
                             // A 200 here is definitive: the server sent the
@@ -969,16 +1177,18 @@ public final class ParallelRangeDataSource implements DataSource {
                         // the next byte; this is a normal short 206, not an
                         // error, so no attempt is counted.
                     } finally {
-                        activeSources.remove(source);
-                        try {
-                            source.close();
-                        } catch (IOException ignored) {
-                            // The chunk result is already decided.
-                        }
+                        activeSources.remove(managed);
+                        managed.closeQuietly();
                     }
                 }
             } catch (IOException e) {
                 error = e;
+            } catch (RuntimeException e) {
+                // Closing a source under a blocked read (Engine.close, a
+                // quality or server switch, a fallback) makes OkHttp/Okio
+                // throw unchecked "closed" exceptions. On a worker thread
+                // those would kill the process; treat them as a failed chunk.
+                error = new IOException("Chunk download failed", e);
             } finally {
                 synchronized (lock) {
                     chunk.running = false;
@@ -1010,6 +1220,12 @@ public final class ParallelRangeDataSource implements DataSource {
                     synchronized (lock) {
                         if (closed) {
                             return;
+                        }
+                        int space = chunk.data.length - chunk.filled;
+                        if (read > space) {
+                            // A source that returns more than it was asked for
+                            // must not overflow the chunk buffer.
+                            throw new IOException("Range delivered more than requested");
                         }
                         System.arraycopy(buffer, 0, chunk.data, chunk.filled, read);
                         chunk.filled += read;
@@ -1156,15 +1372,20 @@ public final class ParallelRangeDataSource implements DataSource {
     public static final class Factory implements DataSource.Factory {
         private final DataSource.Factory singleFactory;
         private final DataSource.Factory chunkFactory;
+        private final BufferSignals signals;
 
-        public Factory(DataSource.Factory singleFactory, DataSource.Factory chunkFactory) {
+        public Factory(
+                DataSource.Factory singleFactory,
+                DataSource.Factory chunkFactory,
+                BufferSignals signals) {
             this.singleFactory = singleFactory;
             this.chunkFactory = chunkFactory;
+            this.signals = signals;
         }
 
         @Override
         public DataSource createDataSource() {
-            return new ParallelRangeDataSource(singleFactory, chunkFactory);
+            return new ParallelRangeDataSource(singleFactory, chunkFactory, signals);
         }
     }
 }
