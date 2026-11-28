@@ -265,10 +265,14 @@ stale cache would risk showing an interval from a different encode.
   deliberate: kotlinx.serialization's `coerceInputValues` is off, so a
   provider sending `"skips": null` would otherwise fail the whole episode or
   stream list.
-- Device verification is pending the 1.2.0 APK.
 - APK: `app-debug.apk`, versionCode 12, versionName 1.2.0, 23,666,317 bytes,
   SHA-256 `B1B11A321A3CE7FF02DA4D87AC134A3C4983FC8C2A347FBC83B4B1C71149F485`,
   v1 + v2 signed with the same debug certificate
   (`5595d8d0…b22252`) used since 1.1.4. `classes10.dex` contains
   `BufferSignals`, `VegaLoadControl`, `ParallelRangeDataSource`, `skipLabel`
   and `collectSkips`.
+- Released as tag `v1.2.0` (commit `b6bcc9c`):
+  https://github.com/aashish1332/Vega-tv/releases/tag/v1.2.0 with asset
+  `app-debug.apk`, label `VegaTV-1.2.0.apk`.
+- Device verification is pending the user installing that APK. Items 13 and
+  the `[B]` marks stay open until then.
